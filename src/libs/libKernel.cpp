@@ -1233,7 +1233,14 @@ static KYTY_SYSV_ABI KernelModule KernelLoadStartModule(const char* module_file_
 		return static_cast<KernelModule>(program->unique_id);
 	}
 
-	program = rt->LoadProgram(module_path);
+	program = rt->LoadProgram(module_path, false);
+	if (program == nullptr) {
+		LOGF("\tmodule is not a valid ELF = %s\n", Common::PathToString(module_path).c_str());
+		if (res != nullptr) {
+			*res = KERNEL_ERROR_ENOEXEC;
+		}
+		return KERNEL_ERROR_ENOEXEC;
+	}
 
 	auto handle = program->unique_id;
 

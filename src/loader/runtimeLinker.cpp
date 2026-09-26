@@ -1186,7 +1186,7 @@ RuntimeLinker::~RuntimeLinker() {
 	Clear();
 }
 
-Program* RuntimeLinker::LoadProgram(const std::filesystem::path& elf_name) {
+Program* RuntimeLinker::LoadProgram(const std::filesystem::path& elf_name, bool required) {
 	KYTY_PROFILER_FUNCTION();
 
 	Common::LockGuard lock(m_mutex);
@@ -1209,8 +1209,12 @@ Program* RuntimeLinker::LoadProgram(const std::filesystem::path& elf_name) {
 		LoadProgramToMemory(program);
 		ParseProgramDynamicInfo(program);
 		CreateSymbolDatabase(program);
-	} else {
+	} else if (required) {
 		EXIT("elf is not valid: %s\n", Common::PathToString(elf_name).c_str());
+	} else {
+		LOGF_COLOR(Log::Color::BrightYellow, "Skipping invalid module: %s\n",
+		           Common::PathToString(elf_name).c_str());
+		return nullptr;
 	}
 
 	m_programs.push_back(program_owner.release());
@@ -1690,7 +1694,10 @@ void RuntimeLinker::PreloadAdjacentPrograms() {
 	add_dir(root / "sce_modules");
 
 	for (const auto& path: module_paths) {
-		auto* program                        = LoadProgram(path);
+		auto* program = LoadProgram(path, false);
+		if (program == nullptr) {
+			continue;
+		}
 		program->fail_if_global_not_resolved = false;
 	}
 }

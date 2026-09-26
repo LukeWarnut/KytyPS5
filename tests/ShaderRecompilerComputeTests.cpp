@@ -29632,9 +29632,123 @@ void CheckTessellationProgram(const char *name, u32 ls_stride, u32 hs_stride) {
   std::printf("[host]    %-32s ok\n", name);
 }
 
+void CheckUnityTessellationStride() {
+  using namespace ShaderRecompiler;
+  constexpr u32 ls_stride = 124;
+  constexpr u32 hs_stride = 128;
+  std::vector<u32> local;
+  local.push_back(EncodeVop2(0x0b, 21, 255u, 3));
+  local.push_back(ls_stride);
+  local.push_back(EncodeDs0(0x0e, (3u << 8u) | 1u));
+  local.push_back(EncodeDs1Ex(0, 5, 2, 21));
+  local.push_back(EncodeSop1(0x20, 0, 6));
+  local.push_back(0xffffffffu);
+
+  std::vector<u32> control;
+  // Unity extracts SV_OutputControlPointID as 8 bits, copies patch ID, and
+  // folds the offchip base plus a dword offset into the LDS address.
+  AppendVop3(&control, 0x148, 20, Vgpr(1), InlineU32(8), InlineU32(8));
+  control.push_back(EncodeVop1(0x01, 21, Vgpr(0)));
+  control.push_back(EncodeVop2(0x25, 21, 2, 21));
+  control.push_back(EncodeSopk(0x00, 8, ls_stride));
+  control.push_back(EncodeVop2(0x0b, 22, 8, 20));
+  control.push_back(EncodeVop2(0x25, 22, InlineU32(4), 22));
+  control.push_back(EncodeDs0(0x36));
+  control.push_back(EncodeDs1(23, 0, 22));
+  control.push_back(EncodeVop2(0x1b, 25, 255u, 1));
+  control.push_back(0xffu);
+  control.push_back(EncodeSopk(0x00, 9, hs_stride));
+  control.push_back(EncodeVop2(0x0b, 24, 249u, 1));
+  control.push_back(EncodeVop2Sdwa(9, 6, 0, 6, 1, 0, 0, 0, 0, 0, 0, 1));
+  control.push_back(EncodeMubuf0(0x1c));
+  control.push_back(EncodeMubuf1(23, 2, 24, 2));
+  // Unity addresses the tess-factor ring with PrimitiveId * 16.
+  control.push_back(EncodeVop2(0x1a, 4, InlineU32(4), 0));
+  for (u32 i = 0; i < 4; i++) {
+    AppendVMovLiteral(&control, 10 + i,
+                      std::bit_cast<u32>(static_cast<float>(i + 1)));
+  }
+  control.push_back(EncodeMubuf0(0x1e));
+  control.push_back(EncodeMubuf1(10, 2, 4, 4));
+  AppendEnd(&control);
+
+  ShaderTessellationInputInfo tess{.input_control_points = 3,
+                                  .output_control_points = 3,
+                                  .domain = 1,
+                                  .partitioning = 2,
+                                  .output_topology = 2};
+  AnalyzeTessellationPrograms(local, control, tess);
+  Require("TessellationUnityStride", "decoded interface",
+          tess.ls_stride == ls_stride && tess.hs_stride == hs_stride,
+          "Unity HS addressing must still recover distinct LS and HS strides");
+
+  ShaderVertexInputInfo vertex;
+  vertex.logical_stage = ShaderType::TessellationControl;
+  vertex.tess = tess;
+  CompileOptions options;
+  options.stage = ShaderType::TessellationControl;
+  options.input_info.vertex = &vertex;
+  auto translated = TranslateProgram(control, options);
+  bool dynamic_factor = false;
+  for (const auto *block : translated.program.blocks) {
+    for (const auto &inst : *block) {
+      if (inst.GetOpcode() == IR::ValueOpcode::SetTessellationAttribute &&
+          inst.Arg(0).U32() ==
+              static_cast<u32>(IR::TessellationAttribute::Factor) &&
+          !inst.Arg(1).IsImmediate()) {
+        dynamic_factor = true;
+      }
+    }
+  }
+  Require("TessellationUnityStride", "dynamic factor ring", dynamic_factor,
+          "Unity factor stores include PrimitiveId and must remain dynamic");
+  auto result = CompileProgram(std::move(translated), options, {});
+  ValidateSpirv("TessellationUnityStride", result.spirv);
+  spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
+  std::string assembly;
+  Require("TessellationUnityStride", "disassembly",
+          tools.Disassemble(result.spirv, &assembly),
+          "failed to disassemble Unity hull shader");
+  Require("TessellationUnityStride", "factor builtins",
+          assembly.find("TessLevelOuter") != std::string::npos &&
+              assembly.find("TessLevelInner") != std::string::npos,
+          "dynamic factor stores must still write Vulkan tessellation builtins");
+
+  std::vector<u32> evaluation;
+  // Unity TES indexes the offchip ring with PrimitiveId (v8) * hs_stride.
+  AppendVop3(&evaluation, 0x169, 24, 255u, Vgpr(8));
+  evaluation.push_back(hs_stride);
+  evaluation.push_back(EncodeMubuf0(0x0d, 28));
+  evaluation.push_back(EncodeMubuf1(10, 2, 24, 4));
+  evaluation.push_back(EncodeExp0(0x0c, 0xf));
+  evaluation.push_back(EncodeExp1(10, 11, 5, 6));
+  AppendEnd(&evaluation);
+
+  vertex.logical_stage = ShaderType::TessellationEvaluation;
+  options.stage = ShaderType::TessellationEvaluation;
+  auto tes = TranslateProgram(evaluation, options);
+  bool dynamic_eval = false;
+  for (const auto *block : tes.program.blocks) {
+    for (const auto &inst : *block) {
+      if (inst.GetOpcode() == IR::ValueOpcode::GetTessellationAttribute &&
+          inst.Arg(0).U32() ==
+              static_cast<u32>(IR::TessellationAttribute::EvaluationInput) &&
+          !inst.Arg(1).IsImmediate()) {
+        dynamic_eval = true;
+      }
+    }
+  }
+  Require("TessellationUnityStride", "dynamic evaluation ring", dynamic_eval,
+          "Unity TES control-point loads include PrimitiveId and must remain dynamic");
+  auto tes_result = CompileProgram(std::move(tes), options, {});
+  ValidateSpirv("TessellationUnityStrideTES", tes_result.spirv);
+  std::printf("[host]    %-32s ok\n", "TessellationUnityStride");
+}
+
 void CheckTessellationPrograms() {
   CheckTessellationProgram("TessellationShiftedStride", 124, 128);
   CheckTessellationProgram("TessellationMultipliedStride", 108, 112);
+  CheckUnityTessellationStride();
 }
 
 void CheckEmbeddedFetchVertexOffset() {
