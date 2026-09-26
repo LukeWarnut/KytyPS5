@@ -5,6 +5,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <compare>
+#include <cstdint>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -23,11 +24,15 @@ public:
 	KYTY_CLASS_NO_COPY(BlitHelper);
 
 	void ReinterpretColorAsMsDepth(Image& source, Image& destination);
+	void CopyMsDepthToColor(Image& source, Image& destination, uint32_t sample);
 
 private:
+	enum class PipelineKind : uint8_t { ColorToMsDepth, MsDepthToColor };
+
 	struct PipelineKey {
-		uint32_t   samples = 1;
-		vk::Format format  = vk::Format::eUndefined;
+		PipelineKind kind    = PipelineKind::ColorToMsDepth;
+		uint32_t     samples = 1;
+		vk::Format   format  = vk::Format::eUndefined;
 
 		auto operator<=>(const PipelineKey&) const = default;
 	};
@@ -45,6 +50,7 @@ private:
 	vk::PipelineLayout      m_pipeline_layout   = nullptr;
 	vk::ShaderModule        m_vertex_shader     = nullptr;
 	vk::ShaderModule        m_fragment_shader   = nullptr;
+	vk::ShaderModule        m_ms_depth_to_color_shader = nullptr;
 	std::vector<Pipeline>   m_pipelines;
 };
 

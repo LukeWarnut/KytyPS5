@@ -46,6 +46,9 @@ constexpr auto MakeContextDispatchTable() {
 	g_hw_ctx_func[Pm4::PA_SU_POINT_SIZE]               = HwCtxSetPointState;
 	g_hw_ctx_func[Pm4::PA_SU_POINT_MINMAX]             = HwCtxSetPointState;
 	g_hw_ctx_func[Pm4::PA_CL_CLIP_CNTL]                = HwCtxSetClipControl;
+	for (auto cmd_offset = Pm4::PA_CL_UCP_0_X; cmd_offset <= Pm4::PA_CL_UCP_5_W; cmd_offset++) {
+		g_hw_ctx_func[cmd_offset] = HwCtxSetUserClipPlanes;
+	}
 	g_hw_ctx_func[Pm4::PA_SU_SC_MODE_CNTL]             = HwCtxSetModeControl;
 	g_hw_ctx_func[Pm4::PA_SU_POLY_OFFSET_DB_FMT_CNTL]  = HwCtxSetPolyOffsetRegisters;
 	g_hw_ctx_func[Pm4::PA_SU_POLY_OFFSET_CLAMP]        = HwCtxSetPolyOffsetRegisters;

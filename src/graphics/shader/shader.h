@@ -73,6 +73,17 @@ struct ShaderClipSpaceTransform {
 	bool  enabled        = false;
 };
 
+struct ShaderUserClipState {
+	static constexpr uint32_t PlaneCount = 6;
+
+	float   planes[PlaneCount][4] = {};
+	uint8_t enable_mask           = 0;
+	bool    cull_only             = false;
+	bool    negate_y              = false;
+	bool    vertex_kill_any       = false;
+	bool    clip_error_cull       = true;
+};
+
 struct ShaderWorkgroupInputInfo {
 	uint32_t threads_num[3]      = {0, 0, 0};
 	uint32_t lds_size_dwords     = 0;
@@ -138,6 +149,7 @@ struct ShaderVertexInputInfo {
 	uint32_t                scratch_size_dwords = 0;
 	uint32_t                pa_cl_vs_out_cntl    = 0;
 	ShaderClipSpaceTransform clip_space;
+	ShaderUserClipState      user_clip;
 	ShaderMeshInputInfo      mesh;
 	ShaderTessellationInputInfo tess;
 	bool                    fetch_external      = false;

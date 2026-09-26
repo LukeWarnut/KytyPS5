@@ -9,8 +9,6 @@ namespace Libs::Graphics::Pm4 {
 
 namespace {
 
-enum class PacketType : uint32_t { Type0, Type1, Type2, Type3 };
-
 constexpr auto MakeRegisterNames() {
 	std::array<const char*, R_NUM> names {};
 	for (auto& name: names) {
@@ -119,7 +117,7 @@ void DumpPm4PacketStream(Common::File* file, const uint32_t* cmd_buffer, uint32_
 
 		uint32_t len = 0;
 
-		const auto packet_type = static_cast<PacketType>(cmd_id >> 30u);
+		const auto packet_type = GetPacketType(cmd_id);
 		// Type-2 packets are header-only padding; every other packet type requires a body.
 		EXIT_NOT_IMPLEMENTED(dw < 2 && packet_type != PacketType::Type2);
 
@@ -157,10 +155,21 @@ void DumpPm4PacketStream(Common::File* file, const uint32_t* cmd_buffer, uint32_
 				}
 				break;
 			}
-			case PacketType::Type0:
-			case PacketType::Type1:
+			case PacketType::Type0: {
+				const auto base = Type0BaseIndex(cmd_id);
+				len             = Type0BodyDwords(cmd_id);
+				EXIT_NOT_IMPLEMENTED(len >= dw);
+				file->Printf("TYPE0 REG:0x%04" PRIx32 " CNT:%u\n", base, len);
+				for (uint32_t i = 0; i < len; i++) {
+					file->Printf("      | 0x%08" PRIx32 " | \n", cmd[i]);
+				}
+				break;
+			}
 			case PacketType::Type2:
-				file->Printf("<unsupported TYPE%u packet>\n", static_cast<uint32_t>(packet_type));
+				file->Printf("TYPE2 PAD\n");
+				break;
+			case PacketType::Type1:
+				file->Printf("<unsupported TYPE1 packet>\n");
 				break;
 		}
 

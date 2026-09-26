@@ -1,6 +1,9 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 
+#include "common/logging/log.h"
+
 #include <algorithm>
+#include <atomic>
 #include <bit>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
@@ -498,14 +501,47 @@ void DefineOutputs(EmitterState& state) {
 		DefineMeshOutputs(state);
 		return;
 	}
-	if (state.program.stage == ShaderType::Vertex && clip_distance_count + cull_distance_count < 8u &&
-	    std::ranges::any_of(state.outputs, [](const OutputBinding& output) {
-		    return output.kind == IR::StageOutputKind::Position;
-	    })) {
-		// Reserve one plane for the enabled PA_CL_CLIP_CNTL clipping-error cull.
-		state.invalid_position_clip_distance = clip_distance_count++;
-		state.outputs.push_back({{IR::StageOutputKind::ClipDistance,
-		                          state.invalid_position_clip_distance, 0, "gl_ClipDistance"}});
+	const bool last_clip_stage = state.program.stage == ShaderType::Vertex ||
+	                             state.program.stage == ShaderType::TessellationEvaluation;
+	const auto* vertex = last_clip_stage ? state.input_info.vertex : nullptr;
+	const auto remaining_distances = [&] {
+		const auto used = clip_distance_count + cull_distance_count;
+		return used >= 8u ? 0u : 8u - used;
+	};
+	const bool has_position = std::ranges::any_of(state.outputs, [](const OutputBinding& output) {
+		return output.kind == IR::StageOutputKind::Position;
+	});
+	if (vertex != nullptr && has_position) {
+		const auto& user_clip = vertex->user_clip;
+		for (uint32_t plane = 0; plane < ShaderUserClipState::PlaneCount; plane++) {
+			if ((user_clip.enable_mask & (1u << plane)) == 0) {
+				continue;
+			}
+			if (remaining_distances() == 0) {
+				static std::atomic<uint32_t> log_count {0};
+				if (log_count.fetch_add(1, std::memory_order_relaxed) < 8) {
+					Log::WriteToConsoleAndLog("Shader: dropping extra user clip planes\n");
+				}
+				break;
+			}
+			auto& output = state.user_clip_plane_outputs[state.user_clip_plane_output_count++];
+			output.plane_index = plane;
+			output.cull        = user_clip.cull_only;
+			if (user_clip.cull_only) {
+				output.distance_index = cull_distance_count;
+				state.outputs.push_back({{IR::StageOutputKind::CullDistance, cull_distance_count++,
+				                          0, "gl_CullDistance"}});
+			} else {
+				output.distance_index = clip_distance_count;
+				state.outputs.push_back({{IR::StageOutputKind::ClipDistance, clip_distance_count++,
+				                          0, "gl_ClipDistance"}});
+			}
+		}
+		if (user_clip.clip_error_cull && remaining_distances() > 0) {
+			state.invalid_position_clip_distance = clip_distance_count++;
+			state.outputs.push_back({{IR::StageOutputKind::ClipDistance,
+			                          state.invalid_position_clip_distance, 0, "gl_ClipDistance"}});
+		}
 	}
 	const auto BuiltIn = [&](uint32_t& variable, uint32_t type, const char* name,
 	                         spv::BuiltIn builtin) {

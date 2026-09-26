@@ -656,6 +656,23 @@ void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t
 		}
 	}
 
+	uint32_t user_clip_flags = info.user_clip.enable_mask;
+	user_clip_flags |= static_cast<uint32_t>(info.user_clip.cull_only) << 8u;
+	user_clip_flags |= static_cast<uint32_t>(info.user_clip.negate_y) << 9u;
+	user_clip_flags |= static_cast<uint32_t>(info.user_clip.vertex_kill_any) << 10u;
+	user_clip_flags |= static_cast<uint32_t>(info.user_clip.clip_error_cull) << 11u;
+	key.push_back(user_clip_flags);
+	if (info.user_clip.enable_mask != 0) {
+		for (uint32_t plane = 0; plane < ShaderUserClipState::PlaneCount; plane++) {
+			if ((info.user_clip.enable_mask & (1u << plane)) == 0) {
+				continue;
+			}
+			for (const float value: info.user_clip.planes[plane]) {
+				key.push_back(std::bit_cast<uint32_t>(value));
+			}
+		}
+	}
+
 	key.push_back(info.mesh.threads_num[0]);
 	if (info.mesh.threads_num[0] != 0) {
 		const auto& mesh = info.mesh;

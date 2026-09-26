@@ -184,7 +184,6 @@ static HW::RenderControl DecodeRenderControl(uint32_t value) {
 	    KYTY_PM4_GET(value, DB_RENDER_CONTROL, COPY_STENCIL_TO_COLOR) != 0;
 	r.copy_centroid          = KYTY_PM4_GET(value, DB_RENDER_CONTROL, COPY_CENTROID) != 0;
 	r.copy_sample            = KYTY_PM4_GET(value, DB_RENDER_CONTROL, COPY_SAMPLE);
-	EXIT_NOT_IMPLEMENTED(r.copy_depth_to_color || r.copy_stencil_to_color);
 
 	return r;
 }
@@ -233,35 +232,19 @@ KYTY_HW_CTX_PARSER(HwCtxSetAaConfig) {
 }
 
 KYTY_HW_CTX_PARSER(HwCtxSetAaSampleControl) {
-	if (cmd_id == 0xc0016900 && cmd_offset >= Pm4::PA_SC_AA_SAMPLE_LOCS_PIXEL_X0Y0_0 &&
-	    cmd_offset < Pm4::PA_SC_AA_SAMPLE_LOCS_PIXEL_X0Y0_0 + 16) {
-		auto r = cp.GetCtx().GetAaSampleControl();
-		r.locations[cmd_offset - Pm4::PA_SC_AA_SAMPLE_LOCS_PIXEL_X0Y0_0] = buffer[0];
-		cp.GetCtx().SetAaSampleControl(r);
-		return 1;
+	auto num_values = KYTY_PM4_LEN(cmd_id) - 2u;
+	EXIT_NOT_IMPLEMENTED(num_values == 0);
+	EXIT_NOT_IMPLEMENTED(cmd_offset < Pm4::PA_SC_AA_SAMPLE_LOCS_PIXEL_X0Y0_0);
+	EXIT_NOT_IMPLEMENTED(cmd_offset + num_values - 1u >=
+	                     Pm4::PA_SC_AA_SAMPLE_LOCS_PIXEL_X0Y0_0 + 16);
+
+	auto r = cp.GetCtx().GetAaSampleControl();
+	for (uint32_t i = 0; i < num_values; i++) {
+		r.locations[cmd_offset + i - Pm4::PA_SC_AA_SAMPLE_LOCS_PIXEL_X0Y0_0] = buffer[i];
 	}
+	cp.GetCtx().SetAaSampleControl(r);
 
-	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0106900);
-	EXIT_NOT_IMPLEMENTED(cmd_offset != Pm4::PA_SC_AA_SAMPLE_LOCS_PIXEL_X0Y0_0);
-
-	uint32_t count = 1;
-
-	if (dw >= 20 && buffer[16] == 0xc0026900 && buffer[17] == Pm4::PA_SC_CENTROID_PRIORITY_0) {
-		count = 20;
-
-		HW::AaSampleControl r;
-
-		memcpy(r.locations, buffer, static_cast<size_t>(16) * 4);
-
-		r.centroid_priority =
-		    static_cast<uint64_t>(buffer[18]) | (static_cast<uint64_t>(buffer[19]) << 32u);
-
-		cp.GetCtx().SetAaSampleControl(r);
-	} else {
-		KYTY_NOT_IMPLEMENTED;
-	}
-
-	return count;
+	return num_values;
 }
 
 KYTY_HW_CTX_PARSER(HwCtxSetCentroidPriority) {
@@ -292,8 +275,11 @@ static void HwCtxIgnoreAaMaskRegister([[maybe_unused]] uint32_t cmd_offset,
 
 static void HwCtxIgnoreAlphaToMaskRegister([[maybe_unused]] uint32_t value) {}
 
-static void HwCtxIgnoreDisabledUserClipPlane(CommandProcessor& cp, uint32_t value) {
-	EXIT_NOT_IMPLEMENTED(value != 0 || cp.GetCtx().GetClipControl().user_clip_planes != 0);
+static void HwCtxSetUserClipPlaneComponent(CommandProcessor& cp, uint32_t cmd_offset,
+                                           uint32_t value) {
+	EXIT_NOT_IMPLEMENTED(cmd_offset < Pm4::PA_CL_UCP_0_X || cmd_offset > Pm4::PA_CL_UCP_5_W);
+	const auto index = cmd_offset - Pm4::PA_CL_UCP_0_X;
+	cp.GetCtx().SetUserClipPlaneComponent(index / 4u, index % 4u, std::bit_cast<float>(value));
 }
 
 static void HwCtxIgnoreDrawPayloadControl([[maybe_unused]] uint32_t value) {}
@@ -541,6 +527,15 @@ KYTY_HW_CTX_PARSER(HwCtxSetClipControl) {
 	cp.GetCtx().SetClipControl(DecodeClipControl(buffer[0]));
 
 	return 1;
+}
+
+KYTY_HW_CTX_PARSER(HwCtxSetUserClipPlanes) {
+	auto num_values = KYTY_PM4_LEN(cmd_id) - 2u;
+	EXIT_NOT_IMPLEMENTED(num_values == 0);
+	for (uint32_t i = 0; i < num_values; i++) {
+		HwCtxSetUserClipPlaneComponent(cp, cmd_offset + i, buffer[i]);
+	}
+	return num_values;
 }
 
 KYTY_HW_CTX_PARSER(HwCtxSetColorControl) {
@@ -2176,6 +2171,81 @@ KYTY_CP_OP_PARSER(CpOpMarker) {
 	return len_dw + 1;
 }
 
+void CpApplyType0Writes(CommandProcessor& cp, uint32_t base_index, const uint32_t* values,
+                        uint32_t count) {
+	KYTY_PROFILER_FUNCTION();
+
+	for (uint32_t i = 0; i < count; i++) {
+		const auto reg   = base_index + i;
+		const auto value = values[i];
+
+		if (reg >= Pm4::CONTEXT_REG_BASE && reg < Pm4::CONTEXT_REG_BASE + Pm4::CX_NUM) {
+			const auto offset = reg - Pm4::CONTEXT_REG_BASE;
+			if (offset == Pm4::CX_NOP || HwCtxTrySetFakeRegister(offset, value)) {
+				continue;
+			}
+			auto pfunc = g_hw_ctx_indirect_func[offset];
+			if (pfunc == nullptr) {
+				EXIT("unknown type-0 context register\n\treg = 0x%04" PRIx32
+				     "\n\toffset = 0x%04" PRIx32 "\n\tvalue = 0x%08" PRIx32 "\n",
+				     reg, offset, value);
+			}
+			pfunc(cp, offset, value);
+			continue;
+		}
+
+		if (reg >= Pm4::SH_REG_BASE && reg < Pm4::SH_REG_BASE + Pm4::SH_NUM) {
+			const auto offset = reg - Pm4::SH_REG_BASE;
+			if (offset == Pm4::SH_NOP) {
+				continue;
+			}
+			auto pfunc = g_hw_sh_indirect_func[offset];
+			if (pfunc == nullptr) {
+				EXIT("unknown type-0 shader register\n\treg = 0x%04" PRIx32
+				     "\n\toffset = 0x%04" PRIx32 "\n\tvalue = 0x%08" PRIx32 "\n",
+				     reg, offset, value);
+			}
+			pfunc(cp, offset, value);
+			continue;
+		}
+
+		if (reg >= Pm4::UCONFIG_REG_BASE &&
+		    reg < Pm4::UCONFIG_REG_BASE + Pm4::UC_NUM) {
+			const auto offset = reg - Pm4::UCONFIG_REG_BASE;
+			if (offset == Pm4::UC_NOP) {
+				continue;
+			}
+			auto pfunc = g_hw_uc_indirect_func[offset];
+			if (pfunc == nullptr) {
+				EXIT("unknown type-0 user config register\n\treg = 0x%04" PRIx32
+				     "\n\toffset = 0x%04" PRIx32 "\n\tvalue = 0x%08" PRIx32 "\n",
+				     reg, offset, value);
+			}
+			pfunc(cp, offset, value);
+			continue;
+		}
+
+		// Console Type-0 packets sometimes use SET_*_REG relative offsets in BASE_INDEX
+		// (PACKET0(DB_Z_INFO) == 0x00000010). Apply those when we have a handler.
+		if (reg < Pm4::CX_NUM) {
+			if (reg == Pm4::CX_NOP || HwCtxTrySetFakeRegister(reg, value)) {
+				continue;
+			}
+			auto pfunc = g_hw_ctx_indirect_func[reg];
+			if (pfunc != nullptr) {
+				pfunc(cp, reg, value);
+				continue;
+			}
+		}
+
+		static std::atomic<uint32_t> log_count {0};
+		if (log_count.fetch_add(1, std::memory_order_relaxed) < 64) {
+			LOGF("\t type-0: ignoring MMIO write reg=0x%04" PRIx32 " value=0x%08" PRIx32 "\n",
+			     reg, value);
+		}
+	}
+}
+
 KYTY_CP_OP_PARSER(CpOpNop) {
 	KYTY_PROFILER_FUNCTION();
 
@@ -2917,7 +2987,7 @@ void GraphicsInitJmpTablesCxIndirect() {
 
 	for (auto cmd_offset = Pm4::PA_CL_UCP_0_X; cmd_offset <= Pm4::PA_CL_UCP_5_W; cmd_offset++) {
 		g_hw_ctx_indirect_func[cmd_offset] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-			HwCtxIgnoreDisabledUserClipPlane(cp, value);
+			HwCtxSetUserClipPlaneComponent(cp, cmd_offset, value);
 		};
 	}
 

@@ -572,6 +572,17 @@ void PipelineCache::Save() {
 	m_driver_cache = nullptr;
 }
 
+static void ApplyClipControlToVertexInfo(const HW::Context& context, ShaderVertexInputInfo& info) {
+	const auto& clip     = context.GetClipControl();
+	auto&       user_clip = info.user_clip;
+	user_clip.enable_mask     = clip.EnabledUserClipPlanes();
+	user_clip.cull_only       = clip.UserClipCullOnly();
+	user_clip.negate_y        = clip.user_clip_plane_negate_y;
+	user_clip.vertex_kill_any = clip.vertex_kill_any;
+	user_clip.clip_error_cull = !clip.cull_on_clipping_error_disable;
+	std::memcpy(user_clip.planes, context.GetUserClipPlanes(), sizeof(user_clip.planes));
+}
+
 PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
     const HW::VertexShaderInfo& vertex_regs, const HW::PixelShaderInfo& pixel_regs,
     const HW::ShaderRegisters& sh, const HW::Context& context, const HW::UserConfig& user_config,
@@ -635,6 +646,14 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		clip.half_extent[1] =
 		    static_cast<float>(std::min(limits.maxViewportDimensions[1], 16384u)) * 0.5f;
 		clip.enabled = true;
+	}
+	if (mesh_active && context.GetClipControl().EnabledUserClipPlanes() != 0) {
+		static std::atomic<uint32_t> log_count {0};
+		if (log_count.fetch_add(1, std::memory_order_relaxed) < 8) {
+			LOGF("Pipeline: user clip planes are not applied to mesh shaders\n");
+		}
+	} else {
+		ApplyClipControlToVertexInfo(context, vertex_info[tess_active ? 2u : 0u]);
 	}
 	Common::LockGuard lock(m_mutex);
 	uint32_t          push_data_cursor =

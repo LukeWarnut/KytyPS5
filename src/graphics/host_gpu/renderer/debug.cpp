@@ -398,13 +398,11 @@ static void ClipPrint(const char* func, const HW::ClipControl& c) {
 	     c.force_viewport_index_from_vs_enable ? "true" : "false");
 }
 
-static void ClipCheck(const HW::ClipControl& c) {
-	// dx_linear_attr_clip_enable preserves linear (noperspective) attributes at clip-generated
-	// vertices, which Vulkan provides as part of clipping and interpolation.
-	EXIT_NOT_IMPLEMENTED(c.user_clip_planes != 0 || c.user_clip_plane_mode != 0 ||
-	                     c.vertex_kill_any || c.user_clip_plane_negate_y ||
-	                     c.user_clip_plane_cull_only || c.cull_on_clipping_error_disable ||
-	                     c.force_viewport_index_from_vs_enable);
+static void ClipCheck([[maybe_unused]] const HW::ClipControl& c) {
+	// User clip planes and VTX_KILL_OR are applied as host clip/cull distances from POS0.
+	// DIS_CLIP_ERR_DETECT skips the invalid-position clip guard.
+	// VTE_VPORT_PROVOKE_DISABLE matches Vulkan's VS-exported viewport index.
+	// dx_linear_attr_clip_enable preserves linear attributes at clip-generated vertices.
 }
 
 static void RcPrint(const char* func, const HW::RenderControl& c) {
@@ -415,11 +413,14 @@ static void RcPrint(const char* func, const HW::RenderControl& c) {
 	     "\t resummarize_enable       = %s\n"
 	     "\t stencil_compress_disable = %s\n"
 	     "\t depth_compress_disable   = %s\n"
+	     "\t copy_depth_to_color      = %s\n"
+	     "\t copy_stencil_to_color    = %s\n"
 	     "\t copy_centroid            = %s\n"
 	     "\t copy_sample              = %" PRIu8 "\n",
 	     c.depth_clear_enable ? "true" : "false", c.stencil_clear_enable ? "true" : "false",
 	     c.resummarize_enable ? "true" : "false", c.stencil_compress_disable ? "true" : "false",
-	     c.depth_compress_disable ? "true" : "false", c.copy_centroid ? "true" : "false",
+	     c.depth_compress_disable ? "true" : "false", c.copy_depth_to_color ? "true" : "false",
+	     c.copy_stencil_to_color ? "true" : "false", c.copy_centroid ? "true" : "false",
 	     c.copy_sample);
 }
 
@@ -428,8 +429,9 @@ static void RcCheck(const HW::RenderControl& c) {
 	// EXIT_NOT_IMPLEMENTED(c.stencil_clear_enable != false);
 	// EXIT_NOT_IMPLEMENTED(c.stencil_compress_disable != false);
 	// EXIT_NOT_IMPLEMENTED(c.depth_compress_disable != false);
-	EXIT_NOT_IMPLEMENTED(c.copy_centroid != false);
-	EXIT_NOT_IMPLEMENTED(c.copy_sample != 0);
+	EXIT_NOT_IMPLEMENTED(c.copy_centroid && !c.copy_depth_to_color && !c.copy_stencil_to_color);
+	EXIT_NOT_IMPLEMENTED(c.copy_sample != 0 && !c.copy_depth_to_color &&
+	                     !c.copy_stencil_to_color);
 }
 
 static void McPrint(const char* func, const HW::ModeControl& c) {

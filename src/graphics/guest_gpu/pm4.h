@@ -14,10 +14,33 @@ class File;
 	(0xC0000000u | (((static_cast<uint16_t>(len) - 2u) & 0x3fffu) << 16u) |                        \
 	 (((op) & 0xffu) << 8u) | (((r) & (Pm4::R_NUM - 1u)) << 2u))
 
+// PACKET0(reg, n): n is COUNT (body dwords minus 1).
+#define KYTY_PM4_TYPE0(reg, n) ((((n) & 0x3fffu) << 16u) | ((reg) & 0xffffu))
+
 #define KYTY_PM4_R(cmd_id)   (((cmd_id) >> 2u) & (Pm4::R_NUM - 1u))
 #define KYTY_PM4_LEN(cmd_id) ((((cmd_id) >> 16u) & 0x3fffu) + 2u)
 
 namespace Libs::Graphics::Pm4 {
+
+enum class PacketType : uint32_t { Type0 = 0, Type1 = 1, Type2 = 2, Type3 = 3 };
+
+[[nodiscard]] constexpr PacketType GetPacketType(uint32_t header) {
+	return static_cast<PacketType>(header >> 30u);
+}
+
+[[nodiscard]] constexpr uint32_t Type0BaseIndex(uint32_t header) {
+	return header & 0xffffu;
+}
+
+[[nodiscard]] constexpr uint32_t Type0BodyDwords(uint32_t header) {
+	return ((header >> 16u) & 0x3fffu) + 1u;
+}
+
+// MMIO dword bases used by Type-0 packets and the SET_*_REG opcodes.
+constexpr uint32_t CONFIG_REG_BASE  = 0x2000;
+constexpr uint32_t SH_REG_BASE      = 0x2C00;
+constexpr uint32_t CONTEXT_REG_BASE = 0xA000;
+constexpr uint32_t UCONFIG_REG_BASE = 0xC000;
 
 constexpr uint32_t IT_NOP                       = 0x10;
 constexpr uint32_t IT_SET_BASE                  = 0x11;

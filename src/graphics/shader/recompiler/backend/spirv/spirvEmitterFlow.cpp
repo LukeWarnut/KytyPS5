@@ -326,6 +326,84 @@ uint32_t ExportVector(ValueEmitContext& ctx, uint32_t data, const IR::ExportInfo
 	return vector;
 }
 
+uint32_t ApplyVertexKill(EmitterState& state, uint32_t distance) {
+	if (state.input_info.vertex == nullptr || !state.input_info.vertex->user_clip.vertex_kill_any) {
+		return distance;
+	}
+	const auto is_nan = state.builder.AllocateId();
+	const auto killed = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpFUnordNotEqual, TypeBool(state), is_nan, distance, distance);
+	state.builder.AddFunction(spv::OpSelect, TypeF32(state), killed, is_nan,
+	                          ConstantF32Value(state, -1.0f), distance);
+	return killed;
+}
+
+void StoreClipOrCullDistance(EmitterState& state, uint32_t variable, uint32_t index,
+                             uint32_t distance) {
+	if (variable == 0 || index == UINT32_MAX) {
+		return;
+	}
+	const auto pointer = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpAccessChain,
+	                          TypePointer(state, spv::StorageClassOutput, TypeF32(state)), pointer,
+	                          variable, ConstantU32(state, index));
+	state.builder.AddFunction(spv::OpStore, pointer, ApplyVertexKill(state, distance));
+}
+
+void EmitHardwareUserClipPlanes(EmitterState& state, uint32_t position) {
+	if (state.user_clip_plane_output_count == 0 || state.input_info.vertex == nullptr) {
+		return;
+	}
+	const auto& user_clip = state.input_info.vertex->user_clip;
+	for (uint32_t i = 0; i < state.user_clip_plane_output_count; i++) {
+		const auto& output = state.user_clip_plane_outputs[i];
+		const auto* plane  = user_clip.planes[output.plane_index];
+		const auto  y      = user_clip.negate_y ? -plane[1] : plane[1];
+		const auto  plane_vec = state.builder.Constant(
+		    spv::OpConstantComposite, TypeF32Vector(state, 4), ConstantF32Value(state, plane[0]),
+		    ConstantF32Value(state, y), ConstantF32Value(state, plane[2]),
+		    ConstantF32Value(state, plane[3]));
+		const auto distance = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpDot, TypeF32(state), distance, position, plane_vec);
+		StoreClipOrCullDistance(state,
+		                        output.cull ? state.cull_distance_variable
+		                                    : state.clip_distance_variable,
+		                        output.distance_index, distance);
+	}
+}
+
+void EmitInvalidPositionClip(EmitterState& state, uint32_t position) {
+	if (state.invalid_position_clip_distance == UINT32_MAX) {
+		return;
+	}
+	const auto zero        = state.builder.Constant(spv::OpConstantNull, TypeF32Vector(state, 4));
+	const auto equal       = state.builder.AllocateId();
+	const auto all_zero    = state.builder.AllocateId();
+	const auto nan         = state.builder.AllocateId();
+	const auto inf         = state.builder.AllocateId();
+	const auto any_nan     = state.builder.AllocateId();
+	const auto any_inf     = state.builder.AllocateId();
+	const auto nan_or_inf  = state.builder.AllocateId();
+	const auto invalid     = state.builder.AllocateId();
+	const auto distance    = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpFOrdEqual, TypeBoolVector(state, 4), equal, position, zero);
+	state.builder.AddFunction(spv::OpAll, TypeBool(state), all_zero, equal);
+	state.builder.AddFunction(spv::OpIsNan, TypeBoolVector(state, 4), nan, position);
+	state.builder.AddFunction(spv::OpIsInf, TypeBoolVector(state, 4), inf, position);
+	state.builder.AddFunction(spv::OpAny, TypeBool(state), any_nan, nan);
+	state.builder.AddFunction(spv::OpAny, TypeBool(state), any_inf, inf);
+	state.builder.AddFunction(spv::OpLogicalOr, TypeBool(state), nan_or_inf, any_nan, any_inf);
+	state.builder.AddFunction(spv::OpLogicalOr, TypeBool(state), invalid, all_zero, nan_or_inf);
+	state.builder.AddFunction(spv::OpSelect, TypeF32(state), distance, invalid,
+	                          ConstantF32Value(state, -1.0f), ConstantF32Value(state, 0.0f));
+	StoreClipOrCullDistance(state, state.clip_distance_variable,
+	                        state.invalid_position_clip_distance, distance);
+	static std::atomic_bool logged = false;
+	if (!logged.exchange(true, std::memory_order_relaxed)) {
+		Log::WriteToConsoleAndLog("Shader: emitted zero-position clip guard\n");
+	}
+}
+
 void EmitAuxPositionExport(ValueEmitContext& ctx, uint32_t data, const IR::ExportInfo& exp) {
 	auto& state = ctx.state;
 	for (uint32_t component = 0; component < 4; component++) {
@@ -366,18 +444,8 @@ void EmitAuxPositionExport(ValueEmitContext& ctx, uint32_t data, const IR::Expor
 			state.builder.AddFunction(spv::OpStore, state.point_size_variable, f32);
 			continue;
 		}
-		auto StoreDistance = [&](uint32_t variable, uint32_t index) {
-			if (index == UINT32_MAX) {
-				return;
-			}
-			const auto pointer = state.builder.AllocateId();
-			state.builder.AddFunction(spv::OpAccessChain,
-			                          TypePointer(state, spv::StorageClassOutput, TypeF32(state)),
-			                          pointer, variable, ConstantU32(state, index));
-			state.builder.AddFunction(spv::OpStore, pointer, f32);
-		};
-		StoreDistance(state.clip_distance_variable, output.clip_distance);
-		StoreDistance(state.cull_distance_variable, output.cull_distance);
+		StoreClipOrCullDistance(state, state.clip_distance_variable, output.clip_distance, f32);
+		StoreClipOrCullDistance(state, state.cull_distance_variable, output.cull_distance, f32);
 	}
 }
 
@@ -514,31 +582,8 @@ void EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 			state.builder.AddFunction(spv::OpStore, MeshOutputPointer(state, kind, exp.index),
 			                          value);
 		} else if (exp.kind == IR::ExportTargetKind::Position) {
-			if (state.invalid_position_clip_distance != UINT32_MAX) {
-				const auto zero = state.builder.Constant(spv::OpConstantNull, TypeF32Vector(state, 4));
-				const auto equal = state.builder.AllocateId();
-				const auto invalid = state.builder.AllocateId();
-				const auto distance = state.builder.AllocateId();
-				const auto distance_pointer = state.builder.AllocateId();
-				state.builder.AddFunction(spv::OpFOrdEqual, TypeBoolVector(state, 4), equal,
-				                          value, zero);
-				state.builder.AddFunction(spv::OpAll, TypeBool(state), invalid, equal);
-				// Zero at valid vertices makes a primitive containing an invalid position
-				// collapse to its remaining edge, before the undefined 0/0 perspective divide.
-				state.builder.AddFunction(spv::OpSelect, TypeF32(state), distance, invalid,
-				                          ConstantF32Value(state, -1.0f),
-				                          ConstantF32Value(state, 0.0f));
-				state.builder.AddFunction(
-				    spv::OpAccessChain, TypePointer(state, spv::StorageClassOutput, TypeF32(state)),
-				    distance_pointer, state.clip_distance_variable,
-				    ConstantU32(state, state.invalid_position_clip_distance));
-				state.builder.AddFunction(spv::OpStore, distance_pointer, distance);
-				static std::atomic_bool logged = false;
-				if (!logged.exchange(true, std::memory_order_relaxed)) {
-					Log::WriteToConsoleAndLog(
-					    "Shader: emitted zero-position clip guard\n");
-				}
-			}
+			EmitInvalidPositionClip(state, value);
+			EmitHardwareUserClipPlanes(state, value);
 			const auto pointer = state.builder.AllocateId();
 			state.builder.AddFunction(
 			    spv::OpAccessChain,

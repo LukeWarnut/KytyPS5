@@ -63,6 +63,7 @@ uint32_t HwCtxSetColorControl(CommandProcessor&, uint32_t, uint32_t, const uint3
 uint32_t HwCtxSetDepthBounds(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);
 uint32_t HwCtxSetPointState(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);
 uint32_t HwCtxSetClipControl(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);
+uint32_t HwCtxSetUserClipPlanes(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);
 uint32_t HwCtxSetModeControl(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);
 uint32_t HwCtxSetPolyOffsetRegisters(CommandProcessor&, uint32_t, uint32_t, const uint32_t*,
                                      uint32_t);
@@ -111,6 +112,7 @@ uint32_t HwUcSetBorderColorTableAddr(CommandProcessor&, uint32_t, uint32_t, cons
 uint32_t HwUcSetGeIndexOffset(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);
 uint32_t HwUcSetGdsOaRegisters(CommandProcessor&, uint32_t, uint32_t, const uint32_t*, uint32_t);
 
+void     CpApplyType0Writes(CommandProcessor&, uint32_t, const uint32_t*, uint32_t);
 uint32_t CpOpNop(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
 uint32_t CpOpContextState(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
 uint32_t CpOpSetBase(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);

@@ -529,6 +529,12 @@ struct RenderExecutorTestAccess {
     return executor.DepthStencilCopy(buffer);
   }
 
+  static bool CopyDepthStencilToColor(RenderExecutor &executor,
+                                      CommandBuffer &buffer,
+                                      uint32_t slice_offset = 0) {
+    return executor.CopyDepthStencilToColor(buffer, slice_offset);
+  }
+
   static void ResolveRenderColorTarget(RenderExecutor &executor,
                                        CommandBuffer &buffer,
                                        RenderColorInfo &color, uint32_t slot) {
@@ -11683,6 +11689,135 @@ public:
       RenderExecutorTestAccess::ResetBindings(executor);
       registers.SetDepthRenderOverride({});
       registers.SetColorControl({});
+
+      constexpr uint64_t d2c_depth_address = base + 0x200000;
+      constexpr uint64_t d2c_color_address = base + 0x240000;
+      constexpr uint64_t s2c_color_address = base + 0x280000;
+      constexpr uint32_t d2c_side = 8;
+      HW::DepthRenderTarget d2c_depth_target{};
+      d2c_depth_target.z_info.format = Prospero::DepthFormat::kZ32F;
+      d2c_depth_target.z_info.texture_compatibility =
+          Prospero::TextureCompatiblePlaneCompression::kEnable;
+      d2c_depth_target.stencil_info.format = Prospero::StencilFormat::k8UInt;
+      d2c_depth_target.stencil_info.texture_compatibility =
+          Prospero::TextureCompatibleStencil::kEnable;
+      d2c_depth_target.z_read_base_addr = d2c_depth_address;
+      d2c_depth_target.z_write_base_addr = d2c_depth_address;
+      d2c_depth_target.stencil_read_base_addr = base + 0x220000;
+      d2c_depth_target.stencil_write_base_addr = base + 0x220000;
+      d2c_depth_target.size = {d2c_side - 1, d2c_side - 1, true};
+      HW::DepthControl d2c_depth_control{};
+      d2c_depth_control.z_enable = true;
+      d2c_depth_control.z_write_enable = true;
+      d2c_depth_control.stencil_enable = true;
+      registers.SetDepthRenderTarget(d2c_depth_target);
+      registers.SetDepthControl(d2c_depth_control);
+      registers.SetRenderControl({});
+      RenderDepthInfo d2c_depth{};
+      RenderExecutorTestAccess::ResolveRenderDepthTarget(
+          executor, scheduler.Current(), d2c_depth);
+      (void)texture_cache.FindDepthTarget(d2c_depth.image_id, d2c_depth.desc);
+      RenderExecutorTestAccess::ResetBindings(executor);
+      {
+        auto &image = texture_cache.GetImage(d2c_depth.image_id);
+        image.Transit(vk::ImageLayout::eTransferDstOptimal,
+                      vk::AccessFlagBits2::eTransferWrite, {},
+                      scheduler.Current().Handle());
+        const vk::ClearDepthStencilValue clear{0.25f, 0x5au};
+        const vk::ImageSubresourceRange range{
+            vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil,
+            0, 1, 0, 1};
+        scheduler.Current().Handle().clearDepthStencilImage(
+            image.backing.image, vk::ImageLayout::eTransferDstOptimal, &clear, 1,
+            &range);
+        texture_cache.MarkGpuWritten(d2c_depth.image_id);
+      }
+      registers.SetColorBase(0, {.addr = d2c_color_address});
+      registers.SetColorInfo(
+          0, {.format = Prospero::ChannelLayout::k32,
+              .channel_type = Prospero::ChannelType::kFloat,
+              .channel_order = Prospero::ChannelOrder::kStandard});
+      registers.SetColorAttrib2(0, {.height = d2c_side - 1, .width = d2c_side - 1});
+      registers.SetColorAttrib3(0, {.tile_mode = Prospero::TileMode::kRenderTarget,
+                                    .dimension = 1,
+                                    .metadata_pipe_aligned = true});
+      registers.SetRenderTargetMask(0x0f);
+      HW::RenderControl d2c_control{};
+      d2c_control.copy_depth_to_color = true;
+      registers.SetRenderControl(d2c_control);
+      Require(name, "copy depth to color",
+              RenderExecutorTestAccess::CopyDepthStencilToColor(
+                  executor, scheduler.Current()),
+              "DB copy-depth-to-color did not consume the draw");
+      RenderExecutorTestAccess::ResetBindings(executor);
+      RenderColorInfo d2c_color{};
+      registers.SetRenderControl({});
+      RenderExecutorTestAccess::ResolveRenderColorTarget(
+          executor, scheduler.Current(), d2c_color, 0);
+      const auto d2c_texels = d2c_side * d2c_side;
+      auto d2c_readback = CreateHostBuffer(
+          name, d2c_texels * sizeof(uint32_t), vk::BufferUsageFlagBits::eTransferDst,
+          {});
+      const vk::BufferImageCopy d2c_copy{
+          0, 0, 0, {vk::ImageAspectFlagBits::eColor, 0, 0, 1}, {}, {d2c_side, d2c_side, 1}};
+      texture_cache.GetImage(d2c_color.image_id)
+          .Download(std::span{&d2c_copy, 1}, d2c_readback.buffer, 0,
+                    d2c_readback.size);
+      scheduler.Current().Handle().pipelineBarrier2(bounds_dependency);
+      scheduler.Finish();
+      const auto d2c_result = ReadBuffer(name, d2c_readback, d2c_texels);
+      Require(name, "copied depth bits",
+              std::ranges::all_of(d2c_result,
+                                  [](uint32_t value) {
+                                    return value == std::bit_cast<uint32_t>(0.25f);
+                                  }),
+              "copy-depth-to-color did not write the depth values as color");
+      DestroyBuffer(&d2c_readback);
+
+      registers.SetColorBase(0, {.addr = s2c_color_address});
+      registers.SetColorInfo(
+          0, {.format = Prospero::ChannelLayout::k8,
+              .channel_type = Prospero::ChannelType::kUInt,
+              .channel_order = Prospero::ChannelOrder::kStandard});
+      registers.SetColorAttrib2(0, {.height = d2c_side - 1, .width = d2c_side - 1});
+      registers.SetColorAttrib3(0, {.tile_mode = Prospero::TileMode::kRenderTarget,
+                                    .dimension = 1,
+                                    .metadata_pipe_aligned = true});
+      HW::RenderControl s2c_control{};
+      s2c_control.copy_stencil_to_color = true;
+      registers.SetRenderControl(s2c_control);
+      Require(name, "copy stencil to color",
+              RenderExecutorTestAccess::CopyDepthStencilToColor(
+                  executor, scheduler.Current()),
+              "DB copy-stencil-to-color did not consume the draw");
+      RenderExecutorTestAccess::ResetBindings(executor);
+      RenderColorInfo s2c_color{};
+      registers.SetRenderControl({});
+      RenderExecutorTestAccess::ResolveRenderColorTarget(
+          executor, scheduler.Current(), s2c_color, 0);
+      auto s2c_readback = CreateHostBuffer(name, d2c_texels,
+                                           vk::BufferUsageFlagBits::eTransferDst, {});
+      const vk::BufferImageCopy s2c_copy{
+          0, 0, 0, {vk::ImageAspectFlagBits::eColor, 0, 0, 1}, {}, {d2c_side, d2c_side, 1}};
+      texture_cache.GetImage(s2c_color.image_id)
+          .Download(std::span{&s2c_copy, 1}, s2c_readback.buffer, 0,
+                    s2c_readback.size);
+      scheduler.Current().Handle().pipelineBarrier2(bounds_dependency);
+      scheduler.Finish();
+      const auto s2c_result = ReadBuffer(name, s2c_readback, d2c_texels / 4);
+      Require(name, "copied stencil bytes",
+              std::ranges::all_of(
+                  std::span{reinterpret_cast<const uint8_t *>(s2c_result.data()),
+                            d2c_texels},
+                  [](uint8_t value) { return value == 0x5au; }),
+              "copy-stencil-to-color did not write the stencil values as color");
+      DestroyBuffer(&s2c_readback);
+      registers.SetColorBase(0, {});
+      registers.SetColorInfo(0, {});
+      registers.SetColorAttrib2(0, {});
+      registers.SetColorAttrib3(0, {});
+      registers.SetRenderTargetMask(0);
+      registers.SetRenderControl({});
 
       auto shared_depth_descriptor = sampled_depth_descriptor;
       shared_depth_descriptor.fields[0] =
@@ -32582,7 +32717,64 @@ void CheckClipControlDepthClipState() {
   clip.min_z_clip_disable = true;
   Require("ClipControlDepthClipState", "both disabled", !clip.IsZClipEnabled(),
           "paired Z-clip disable was not represented");
+
+  clip = {};
+  clip.user_clip_plane_mode = 2;
+  Require("ClipControlDepthClipState", "clip mode keeps clip distances",
+          !clip.UserClipCullOnly() && clip.EnabledUserClipPlanes() == 0,
+          "PS_UCP_MODE clip did not stay on clip distances");
+  clip.user_clip_plane_mode = 1;
+  Require("ClipControlDepthClipState", "cull mode", clip.UserClipCullOnly(),
+          "PS_UCP_MODE cull did not select cull distances");
+  clip.user_clip_plane_mode = 0;
+  clip.user_clip_plane_cull_only = true;
+  Require("ClipControlDepthClipState", "cull-only flag", clip.UserClipCullOnly(),
+          "UCP_CULL_ONLY_ENA did not select cull distances");
   std::printf("[host]    %-32s ok\n", "ClipControlDepthClipState");
+}
+
+void CheckPm4UserClipPlanes(RenderContext &renderer) {
+  GraphicsInitJmpTables();
+  CommandProcessor processor(renderer, 0);
+  const float x = 1.0f;
+  const float y = -2.0f;
+  const float z = 0.25f;
+  const float w = -0.5f;
+  const std::array<uint32_t, 4> plane{
+      std::bit_cast<uint32_t>(x), std::bit_cast<uint32_t>(y),
+      std::bit_cast<uint32_t>(z), std::bit_cast<uint32_t>(w)};
+  const auto consumed = HwCtxSetUserClipPlanes(
+      processor, 0xC0046900u, Pm4::PA_CL_UCP_0_X, plane.data(), 4);
+  const auto &planes = processor.GetCtx().GetUserClipPlanes();
+  Require("Pm4UserClipPlanes", "plane 0",
+          consumed == 4 && planes[0][0] == x && planes[0][1] == y &&
+              planes[0][2] == z && planes[0][3] == w,
+          "PA_CL_UCP_0 did not store the plane equation");
+
+  uint32_t clip_cntl = 1u;
+  clip_cntl |= 2u << Pm4::PA_CL_CLIP_CNTL_PS_UCP_MODE_SHIFT;
+  clip_cntl |= 1u << Pm4::PA_CL_CLIP_CNTL_DX_CLIP_SPACE_DEF_SHIFT;
+  clip_cntl |= 1u << Pm4::PA_CL_CLIP_CNTL_VTX_KILL_OR_SHIFT;
+  clip_cntl |= 1u << Pm4::PA_CL_CLIP_CNTL_DX_LINEAR_ATTR_CLIP_ENA_SHIFT;
+  clip_cntl |= 1u << Pm4::PA_CL_CLIP_CNTL_VTE_VPORT_PROVOKE_DISABLE_SHIFT;
+  const auto clip_consumed = HwCtxSetClipControl(
+      processor, 0xC0016900u, Pm4::PA_CL_CLIP_CNTL, &clip_cntl, 1);
+  const auto &clip = processor.GetCtx().GetClipControl();
+  Require("Pm4UserClipPlanes", "clip control",
+          clip_consumed == 1 && clip.EnabledUserClipPlanes() == 1 &&
+              clip.user_clip_plane_mode == 2 && clip.dx_clip_space &&
+              clip.vertex_kill_any && clip.linear_attribute_clip_enable &&
+              clip.force_viewport_index_from_vs_enable && !clip.UserClipCullOnly(),
+          "PA_CL_CLIP_CNTL user-clip flags did not decode");
+
+  std::vector<uint32_t> commands{0xC0016900u, Pm4::PA_CL_UCP_0_X + 4u,
+                                 std::bit_cast<uint32_t>(3.0f)};
+  Pm4Execution execution;
+  Require("Pm4UserClipPlanes", "set context",
+          processor.Process(execution, commands) == Pm4ProcessResult::Complete &&
+              processor.GetCtx().GetUserClipPlanes()[1][0] == 3.0f,
+          "SET_CONTEXT_REG did not write PA_CL_UCP_1_X");
+  std::printf("[host]    %-32s ok\n", "Pm4UserClipPlanes");
 }
 
 void CheckVulkan13FeatureRequirements() {
@@ -32774,6 +32966,152 @@ void CheckPm4StencilInfoValueLane(RenderContext &renderer) {
               !stencil.expclear_enabled && !stencil.htile_stencil_disabled,
           "standalone DB_STENCIL_INFO did not decode its sole payload value");
   std::printf("[host]    %-32s ok\n", "Pm4StencilInfoValueLane");
+}
+
+void CheckPm4RenderControlCopyToColor(RenderContext &renderer) {
+  CommandProcessor processor(renderer, 0);
+  constexpr uint32_t depth_copy =
+      1u << Pm4::DB_RENDER_CONTROL_COPY_DEPTH_TO_COLOR_SHIFT;
+  constexpr uint32_t stencil_copy =
+      1u << Pm4::DB_RENDER_CONTROL_COPY_STENCIL_TO_COLOR_SHIFT;
+  const auto consumed = HwCtxSetRenderControl(
+      processor, 0xC0016900u, Pm4::DB_RENDER_CONTROL, &depth_copy, 1);
+  const auto &depth = processor.GetCtx().GetRenderControl();
+  Require("Pm4RenderControlCopyToColor", "depth copy",
+          consumed == 1 && depth.copy_depth_to_color &&
+              !depth.copy_stencil_to_color,
+          "COPY_DEPTH_TO_COLOR did not decode");
+  const auto consumed_stencil = HwCtxSetRenderControl(
+      processor, 0xC0016900u, Pm4::DB_RENDER_CONTROL, &stencil_copy, 1);
+  const auto &stencil = processor.GetCtx().GetRenderControl();
+  Require("Pm4RenderControlCopyToColor", "stencil copy",
+          consumed_stencil == 1 && stencil.copy_stencil_to_color &&
+              !stencil.copy_depth_to_color,
+          "COPY_STENCIL_TO_COLOR did not decode");
+  std::printf("[host]    %-32s ok\n", "Pm4RenderControlCopyToColor");
+}
+
+void CheckPm4Type0AndType2Packets(RenderContext &renderer) {
+  GraphicsInitJmpTables();
+  CommandProcessor processor(renderer, 0);
+
+  uint32_t suffix = 0;
+  const auto address = reinterpret_cast<uint64_t>(&suffix);
+  const auto append_write = [&](std::vector<uint32_t> &commands, uint32_t value) {
+    commands.push_back(KYTY_PM4(5, Pm4::IT_WRITE_DATA, 0));
+    commands.push_back(0);
+    commands.push_back(static_cast<uint32_t>(address));
+    commands.push_back(static_cast<uint32_t>(address >> 32u));
+    commands.push_back(value);
+  };
+  constexpr uint32_t z_info =
+      static_cast<uint32_t>(Prospero::DepthFormat::kZ32F);
+
+  suffix = 0;
+  {
+    std::vector<uint32_t> commands{KYTY_PM4_TYPE0(Pm4::DB_Z_INFO, 0), z_info};
+    append_write(commands, 33);
+    Pm4Execution execution;
+    Require("Pm4Type0AndType2Packets", "relative DB_Z_INFO",
+            processor.Process(execution, commands) ==
+                    Pm4ProcessResult::Complete &&
+                suffix == 33 &&
+                processor.GetCtx().GetDepthZInfo().format ==
+                    Prospero::DepthFormat::kZ32F,
+            "TYPE0 PACKET0(DB_Z_INFO) did not apply or skipped the following "
+            "packet");
+  }
+
+  suffix = 0;
+  {
+    CommandProcessor absolute(renderer, 0);
+    std::vector<uint32_t> commands{
+        KYTY_PM4_TYPE0(Pm4::CONTEXT_REG_BASE + Pm4::DB_Z_INFO, 0), z_info};
+    append_write(commands, 44);
+    Pm4Execution execution;
+    Require("Pm4Type0AndType2Packets", "absolute DB_Z_INFO",
+            absolute.Process(execution, commands) ==
+                    Pm4ProcessResult::Complete &&
+                suffix == 44 &&
+                absolute.GetCtx().GetDepthZInfo().format ==
+                    Prospero::DepthFormat::kZ32F,
+            "TYPE0 absolute context write did not apply DB_Z_INFO");
+  }
+
+  suffix = 0;
+  {
+    std::vector<uint32_t> commands{0x80000001u};
+    append_write(commands, 55);
+    Pm4Execution execution;
+    Require("Pm4Type0AndType2Packets", "type2 pad",
+            processor.Process(execution, commands) ==
+                    Pm4ProcessResult::Complete &&
+                suffix == 55,
+            "TYPE2 padding other than 0x80000000 was not skipped");
+  }
+
+  suffix = 0;
+  {
+    std::vector<uint32_t> commands{KYTY_PM4_TYPE0(0x1234u, 0), 0xdeadbeefu};
+    append_write(commands, 66);
+    Pm4Execution execution;
+    Require("Pm4Type0AndType2Packets", "ignored privileged",
+            processor.Process(execution, commands) ==
+                    Pm4ProcessResult::Complete &&
+                suffix == 66,
+            "unknown TYPE0 MMIO write was not consumed");
+  }
+
+  std::printf("[host]    %-32s ok\n", "Pm4Type0AndType2Packets");
+}
+
+void CheckPm4PacketLengthBounds(RenderContext &renderer) {
+  GraphicsInitJmpTables();
+  CommandProcessor processor(renderer, 0);
+
+  uint32_t suffix = 11;
+  const auto address = reinterpret_cast<uint64_t>(&suffix);
+  std::array<uint32_t, 3> truncated{
+      KYTY_PM4(5, Pm4::IT_WRITE_DATA, 0), 0,
+      static_cast<uint32_t>(address)};
+  Pm4Execution truncated_execution;
+  Require("Pm4PacketLengthBounds", "truncated write",
+          processor.Process(truncated_execution, truncated) ==
+                  Pm4ProcessResult::Complete &&
+              suffix == 11,
+          "truncated WRITE_DATA aborted instead of draining the IB");
+
+  suffix = 0;
+  std::vector<uint32_t> samples{
+      KYTY_PM4(18, Pm4::IT_SET_CONTEXT_REG, Pm4::R_ZERO),
+      Pm4::PA_SC_AA_SAMPLE_LOCS_PIXEL_X0Y0_0};
+  for (uint32_t i = 0; i < 16; i++) {
+    samples.push_back(i + 1);
+  }
+  samples.push_back(KYTY_PM4(4, Pm4::IT_SET_CONTEXT_REG, Pm4::R_ZERO));
+  samples.push_back(Pm4::PA_SC_CENTROID_PRIORITY_0);
+  samples.push_back(0x11111111u);
+  samples.push_back(0x22222222u);
+  samples.push_back(KYTY_PM4(5, Pm4::IT_WRITE_DATA, 0));
+  samples.push_back(0);
+  samples.push_back(static_cast<uint32_t>(address));
+  samples.push_back(static_cast<uint32_t>(address >> 32u));
+  samples.push_back(77);
+  Pm4Execution sample_execution;
+  const auto &aa = processor.GetCtx().GetAaSampleControl();
+  bool locations_ok = true;
+  Require("Pm4PacketLengthBounds", "sample locs",
+          processor.Process(sample_execution, samples) ==
+                  Pm4ProcessResult::Complete &&
+              suffix == 77,
+          "AA sample locations overran the IB or skipped the following packets");
+  for (uint32_t i = 0; i < 16; i++) {
+    locations_ok &= aa.locations[i] == i + 1;
+  }
+  Require("Pm4PacketLengthBounds", "sample state",
+          locations_ok && aa.centroid_priority == 0x2222222211111111ull,
+          "AA sample locations or centroid priority did not apply");
+  std::printf("[host]    %-32s ok\n", "Pm4PacketLengthBounds");
 }
 
 void CheckPm4NativeTargetGeometryRegisters(RenderContext &renderer) {
@@ -34111,6 +34449,8 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--clip-control-only") == 0) {
     CheckClipControlDepthClipState();
+    VulkanHarness vulkan;
+    CheckPm4UserClipPlanes(vulkan.RuntimeRenderer());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--reference-clock-only") == 0) {
@@ -34270,6 +34610,10 @@ int main(int argc, char **argv) {
     CheckPm4BlendColorRegisterRanges(vulkan.RuntimeRenderer());
     CheckPm4PolygonOffsetRegisters(vulkan.RuntimeRenderer());
     CheckPm4DepthControlHighBits(vulkan.RuntimeRenderer());
+    CheckPm4RenderControlCopyToColor(vulkan.RuntimeRenderer());
+    CheckPm4UserClipPlanes(vulkan.RuntimeRenderer());
+    CheckPm4Type0AndType2Packets(vulkan.RuntimeRenderer());
+    CheckPm4PacketLengthBounds(vulkan.RuntimeRenderer());
     CheckPm4DepthRenderOverride(vulkan.RuntimeRenderer());
     CheckPm4ContextStateOperations(vulkan.RuntimeRenderer());
     return 0;
@@ -34499,6 +34843,10 @@ int main(int argc, char **argv) {
   CheckPm4SyntheticOcclusionCounterDump(vulkan.RuntimeRenderer());
   CheckPm4Predication(vulkan.RuntimeRenderer());
   CheckPm4StencilInfoValueLane(vulkan.RuntimeRenderer());
+  CheckPm4RenderControlCopyToColor(vulkan.RuntimeRenderer());
+  CheckPm4UserClipPlanes(vulkan.RuntimeRenderer());
+  CheckPm4Type0AndType2Packets(vulkan.RuntimeRenderer());
+  CheckPm4PacketLengthBounds(vulkan.RuntimeRenderer());
   CheckPm4NativeTargetGeometryRegisters(vulkan.RuntimeRenderer());
   CheckPm4PrivateAgcShaderRegisters(vulkan.RuntimeRenderer());
   CheckPm4PrivateAgcUconfigRegisters(vulkan.RuntimeRenderer());

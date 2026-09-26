@@ -10,10 +10,13 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/debug.h"
+#include "graphics/host_gpu/renderer/image/blitHelper.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
+#include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -24,6 +27,7 @@
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
+#include <initializer_list>
 #include <limits>
 
 namespace Libs::Graphics {
@@ -299,8 +303,8 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 		}
 		return;
 	}
-	if (rc.copy_depth_to_color || rc.copy_stencil_to_color || rc.copy_centroid ||
-	    rc.copy_sample != 0 || dc.zfunc > static_cast<uint8_t>(vk::CompareOp::eAlways) ||
+	if (rc.copy_centroid || rc.copy_sample != 0 ||
+	    dc.zfunc > static_cast<uint8_t>(vk::CompareOp::eAlways) ||
 	    (!z.depth_view.depth_write_disable && z.z_write_base_addr != z.z_read_base_addr) ||
 	    (has_stencil && !z.depth_view.stencil_write_disable &&
 	     z.stencil_write_base_addr != z.stencil_read_base_addr)) {
@@ -410,6 +414,172 @@ bool RenderExecutor::DepthStencilCopy(CommandBuffer& buffer) {
 	command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal,
 	                  destination.backing.image, vk::ImageLayout::eTransferDstOptimal,
 	                  count, regions.data());
+	return true;
+}
+
+static void CopyStencilAspectToColor(Image& source, Image& destination, Buffer& buffer,
+                                     vk::CommandBuffer command,
+                                     const ImageSubresourceRange& source_range,
+                                     const ImageSubresourceRange& destination_range) {
+	EXIT_IF(buffer.Handle() == nullptr || source.backing.samples != 1 ||
+	        destination.backing.samples != 1 || source_range.level_count != 1 ||
+	        destination_range.level_count != 1);
+	if (destination.info.bytes_per_block != 1) {
+		DepthFatal("stencil-to-color requires an 8-bit color target");
+	}
+	const auto width =
+	    std::min(std::max(source.backing.extent.width >> source_range.base_level, 1u),
+	             std::max(destination.backing.extent.width >> destination_range.base_level, 1u));
+	const auto height =
+	    std::min(std::max(source.backing.extent.height >> source_range.base_level, 1u),
+	             std::max(destination.backing.extent.height >> destination_range.base_level, 1u));
+	const auto layers = std::min({source_range.layer_count, destination_range.layer_count,
+	                               source.backing.layers - source_range.base_layer,
+	                               destination.backing.layers - destination_range.base_layer});
+	const auto row_size = static_cast<uint64_t>(width);
+	if (layers == 0 || width == 0 || height == 0 || row_size > buffer.Size()) {
+		DepthFatal("stencil-to-color copy region is empty or exceeds the utility buffer");
+	}
+	const auto rows_per_copy =
+	    static_cast<uint32_t>(std::min<uint64_t>(height, buffer.Size() / row_size));
+
+	vk::BufferMemoryBarrier2 barrier {};
+	barrier.srcStageMask        = vk::PipelineStageFlagBits2::eTransfer;
+	barrier.srcAccessMask       = vk::AccessFlagBits2::eTransferRead;
+	barrier.dstStageMask        = vk::PipelineStageFlagBits2::eTransfer;
+	barrier.dstAccessMask       = vk::AccessFlagBits2::eTransferWrite;
+	barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.buffer              = buffer.Handle();
+	barrier.offset              = 0;
+	vk::DependencyInfo dependency {};
+	dependency.dependencyFlags          = vk::DependencyFlagBits::eByRegion;
+	dependency.bufferMemoryBarrierCount = 1;
+	dependency.pBufferMemoryBarriers    = &barrier;
+	for (uint32_t layer = 0; layer < layers; layer++) {
+		for (uint32_t y = 0; y < height; y += rows_per_copy) {
+			const auto          copy_height = std::min(rows_per_copy, height - y);
+			vk::BufferImageCopy source_copy {};
+			source_copy.imageSubresource      = {vk::ImageAspectFlagBits::eStencil,
+			                                     source_range.base_level,
+			                                     source_range.base_layer + layer, 1};
+			source_copy.imageOffset           = {0, static_cast<int32_t>(y), 0};
+			source_copy.imageExtent           = {width, copy_height, 1};
+			auto destination_copy             = source_copy;
+			destination_copy.imageSubresource = {vk::ImageAspectFlagBits::eColor,
+			                                     destination_range.base_level,
+			                                     destination_range.base_layer + layer, 1};
+			barrier.size          = row_size * copy_height;
+			barrier.srcAccessMask = vk::AccessFlagBits2::eTransferRead;
+			barrier.dstAccessMask = vk::AccessFlagBits2::eTransferWrite;
+			command.pipelineBarrier2(dependency);
+			command.copyImageToBuffer(source.backing.image, vk::ImageLayout::eTransferSrcOptimal,
+			                          buffer.Handle(), source_copy);
+			barrier.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
+			barrier.dstAccessMask = vk::AccessFlagBits2::eTransferRead;
+			command.pipelineBarrier2(dependency);
+			command.copyBufferToImage(buffer.Handle(), destination.backing.image,
+			                          vk::ImageLayout::eTransferDstOptimal, destination_copy);
+		}
+	}
+}
+
+bool RenderExecutor::CopyDepthStencilToColor(CommandBuffer& buffer,
+                                             uint32_t       render_target_slice_offset) {
+	const auto& hw = buffer.GetRegisters();
+	const auto& rc = hw.GetRenderControl();
+	if (!rc.copy_depth_to_color && !rc.copy_stencil_to_color) {
+		return false;
+	}
+	if (rc.copy_depth_to_color && rc.copy_stencil_to_color) {
+		DepthFatal("simultaneous depth-to-color and stencil-to-color copies");
+	}
+	const auto& z           = hw.GetDepthRenderTarget();
+	const bool  has_stencil = z.stencil_info.format != Prospero::StencilFormat::kInvalid;
+	if (rc.copy_stencil_to_color && !has_stencil) {
+		DepthFatal("stencil-to-color copy without a stencil plane");
+	}
+	if (rc.copy_centroid &&
+	    render_sample_count(z.z_info.num_samples) > 1) {
+		DepthFatal("centroid depth-to-color copies are unimplemented");
+	}
+
+	RenderColorInfo color {};
+	ResolveRenderColorTarget(buffer, color, render_target_slice_offset, 0, true, true);
+	if (!color.image_id) {
+		DepthFatal("depth/stencil-to-color copy without a bound color target");
+	}
+	auto depth_desc = MakeDepthTargetDesc(buffer, z);
+	auto& cache     = m_context.GetTextureCache();
+	const auto depth_id = cache.FindImage(depth_desc);
+	BindRenderTarget(depth_id);
+	BindRenderTarget(color.image_id);
+	if (depth_id == color.image_id) {
+		cache.UpdateImage(depth_id);
+		return true;
+	}
+	if (color.guest_mip_level != 0 || depth_desc.view_info.base_level != 0 ||
+	    color.desc.view_info.base_layer != 0 || depth_desc.view_info.base_layer != 0) {
+		DepthFatal("depth/stencil-to-color copies currently support the base mip and layer");
+	}
+
+	cache.UpdateImage(depth_id);
+	cache.UpdateImage(color.image_id);
+	cache.MarkGpuWritten(color.image_id);
+	auto& source      = cache.GetImage(depth_id);
+	auto& destination = cache.GetImage(color.image_id);
+	const auto src_samples = source.info.samples;
+	const auto dst_samples = destination.info.samples;
+	if (source.info.extent.width != destination.info.extent.width ||
+	    source.info.extent.height != destination.info.extent.height) {
+		DepthFatal("depth/stencil-to-color extent mismatch: %ux%u vs %ux%u",
+		           source.info.extent.width, source.info.extent.height,
+		           destination.info.extent.width, destination.info.extent.height);
+	}
+	if (rc.copy_sample != 0 && (src_samples == 1 || rc.copy_sample >= src_samples)) {
+		DepthFatal("COPY_SAMPLE %u is invalid for %u depth samples", rc.copy_sample, src_samples);
+	}
+
+	static std::atomic_bool logged = false;
+	if (!logged.exchange(true, std::memory_order_relaxed)) {
+		LOGF("CopyDepthStencilToColor: depth=%s stencil=%s sample=%u src_samples=%u "
+		     "dst_samples=%u extent=%ux%u\n",
+		     rc.copy_depth_to_color ? "true" : "false",
+		     rc.copy_stencil_to_color ? "true" : "false", rc.copy_sample, src_samples, dst_samples,
+		     source.info.extent.width, source.info.extent.height);
+	}
+
+	if (rc.copy_depth_to_color) {
+		if (src_samples == 1 && dst_samples == 1) {
+			cache.CopyImage(color.image_id, depth_id);
+		} else if (src_samples > 1 && dst_samples == 1) {
+			cache.m_blit_helper.CopyMsDepthToColor(source, destination, rc.copy_sample);
+		} else {
+			DepthFatal("unsupported depth-to-color sample counts: src=%u dst=%u", src_samples,
+			           dst_samples);
+		}
+		return true;
+	}
+
+	if (src_samples != 1 || dst_samples != 1) {
+		DepthFatal("multisampled stencil-to-color copies are unimplemented");
+	}
+	auto& scheduler = m_context.GetCommandScheduler();
+	scheduler.EndRendering();
+	const auto command = scheduler.Current().Handle();
+	const ImageSubresourceRange source_range {depth_desc.view_info.base_level, 1,
+	                                          depth_desc.view_info.base_layer,
+	                                          depth_desc.view_info.layer_count};
+	const ImageSubresourceRange destination_range {color.desc.view_info.base_level, 1,
+	                                               color.desc.view_info.base_layer,
+	                                               color.desc.view_info.layer_count};
+	source.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead,
+	               source_range, command);
+	destination.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite,
+	                    destination_range, command);
+	CopyStencilAspectToColor(source, destination,
+	                         cache.m_buffer_cache.GetUtilityBuffer(MemoryUsage::DeviceLocal),
+	                         command, source_range, destination_range);
 	return true;
 }
 

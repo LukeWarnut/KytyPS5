@@ -231,6 +231,8 @@ struct GdsOaState {
 };
 
 struct ClipControl {
+	static constexpr uint32_t UserClipPlaneCount = 6;
+
 	uint8_t user_clip_planes                    = 0;
 	uint8_t user_clip_plane_mode                = 0;
 	bool    dx_clip_space                       = false;
@@ -245,6 +247,10 @@ struct ClipControl {
 	bool    force_viewport_index_from_vs_enable = false;
 
 	[[nodiscard]] bool IsZClipEnabled() const { return !min_z_clip_disable && !max_z_clip_disable; }
+	[[nodiscard]] uint8_t EnabledUserClipPlanes() const { return user_clip_planes & 0x3fu; }
+	[[nodiscard]] bool    UserClipCullOnly() const {
+		return user_clip_plane_cull_only || user_clip_plane_mode == 1 || user_clip_plane_mode == 3;
+	}
 };
 
 struct DepthControl {
@@ -815,6 +821,12 @@ public:
 	void SetBlendColor(const BlendColor& color) { m_blend_color = color; }
 	[[nodiscard]] const ClipControl& GetClipControl() const { return m_clip_control; }
 	void SetClipControl(const ClipControl& control) { m_clip_control = control; }
+	void SetUserClipPlaneComponent(uint32_t plane, uint32_t component, float value) {
+		m_user_clip_planes[plane][component] = value;
+	}
+	[[nodiscard]] const float (&GetUserClipPlanes() const)[ClipControl::UserClipPlaneCount][4] {
+		return m_user_clip_planes;
+	}
 	[[nodiscard]] const RenderControl& GetRenderControl() const { return m_render_control; }
 	void SetRenderControl(const RenderControl& control) { m_render_control = control; }
 	[[nodiscard]] const DepthRenderOverride& GetDepthRenderOverride() const {
@@ -910,6 +922,7 @@ private:
 	uint32_t        m_render_target_mask = 0;
 	ScreenViewport  m_screen_viewport;
 	ClipControl     m_clip_control;
+	float           m_user_clip_planes[ClipControl::UserClipPlaneCount][4] = {};
 	ColorControl    m_color_control;
 	ScanModeControl m_scan_mode_control;
 

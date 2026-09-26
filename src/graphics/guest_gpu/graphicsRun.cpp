@@ -80,6 +80,16 @@ static bool GraphicsRunDebugDumpEnabled() {
 	       Config::GetPrintfDirection() != Config::LogDirection::Silent;
 }
 
+static void LogPm4LengthMismatch(const char* why, uint32_t offset, uint32_t header, uint32_t opcode,
+                                 uint32_t packet_dw, uint32_t remaining_dw, uint32_t header_dw) {
+	static std::atomic<uint32_t> log_count {0};
+	if (log_count.fetch_add(1, std::memory_order_relaxed) < 64) {
+		LOGF("\t PM4 %s: offset=0x%05" PRIx32 " cmd_id=0x%08" PRIx32 " op=0x%02" PRIx32
+		     " packet_dw=%" PRIu32 " remaining=%" PRIu32 " header_len=%" PRIu32 "\n",
+		     why, offset, header, opcode, packet_dw, remaining_dw, header_dw);
+	}
+}
+
 GuestGpu::GuestGpu(RenderContext& renderer): m_renderer(renderer) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	GraphicsInitJmpTables();
@@ -709,26 +719,67 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		const auto        total_dw      = static_cast<uint32_t>(cursor.commands.size());
 		const auto        remaining_dw  = total_dw - cursor.offset_dw;
 		const auto        packet_header = packet[0];
+		const auto        packet_type   = Pm4::GetPacketType(packet_header);
 		const auto        opcode        = (packet_header >> 8u) & 0xffu;
 		EXIT_NOT_IMPLEMENTED(remaining_dw > total_dw);
 
-		if (packet_header == 0x80000000u) {
+		if (packet_type == Pm4::PacketType::Type2) {
 			cursor.offset_dw++;
 			execution.m_made_progress = true;
 			continue;
 		}
 
-		EXIT_NOT_IMPLEMENTED(remaining_dw < 2);
+		if (packet_type == Pm4::PacketType::Type0) {
+			const auto body_dw   = Pm4::Type0BodyDwords(packet_header);
+			const auto packet_dw = body_dw + 1u;
+			if (packet_dw > remaining_dw) {
+				LogPm4LengthMismatch("truncated TYPE0", total_dw - remaining_dw, packet_header, 0,
+				                     packet_dw, remaining_dw, packet_dw);
+				cursor.offset_dw += remaining_dw;
+				execution.m_made_progress = true;
+				continue;
+			}
+			if (GraphicsRunDebugDumpEnabled()) {
+				LOGF("CP packet: TYPE0 offset=0x%05" PRIx32 " cmd_id=0x%08" PRIx32
+				     " reg=0x%04" PRIx32 " cnt=%" PRIu32 "\n",
+				     total_dw - remaining_dw, packet_header, Pm4::Type0BaseIndex(packet_header),
+				     body_dw);
+			}
+			CpApplyType0Writes(*this, Pm4::Type0BaseIndex(packet_header), packet + 1, body_dw);
+			cursor.offset_dw += packet_dw;
+			execution.m_made_progress = true;
+			continue;
+		}
+
+		if (packet_type != Pm4::PacketType::Type3) {
+			EXIT("unknown PM4 type\n\t%05" PRIx32 ":\n\tcmd_id = %08" PRIx32 "\n",
+			     total_dw - remaining_dw, packet_header);
+		}
+
+		const auto header_dw = KYTY_PM4_LEN(packet_header);
+		if (remaining_dw < 2 || header_dw == 0 || header_dw > remaining_dw) {
+			LogPm4LengthMismatch("truncated TYPE3", total_dw - remaining_dw, packet_header, opcode,
+			                     header_dw, remaining_dw, header_dw);
+			cursor.offset_dw += remaining_dw;
+			execution.m_made_progress = true;
+			continue;
+		}
 
 		if (GraphicsRunDebugDumpEnabled()) {
 			LOGF("CP packet: offset=0x%05" PRIx32 " cmd_id=0x%08" PRIx32 " op=0x%02" PRIx32
 			     " len=%" PRIu32 "\n",
-			     total_dw - remaining_dw, packet_header, opcode, KYTY_PM4_LEN(packet_header));
+			     total_dw - remaining_dw, packet_header, opcode, header_dw);
 		}
 
 		if ((packet_header & 1u) != 0 && ShouldSkipPredicatedPackets()) {
-			auto packet_dw = KYTY_PM4_LEN(packet_header);
-			EXIT_NOT_IMPLEMENTED(packet_dw == 0 || packet_dw > remaining_dw);
+			auto packet_dw = header_dw;
+			if (packet_dw == 0 || packet_dw > remaining_dw) {
+				LogPm4LengthMismatch("predicated skip truncated", total_dw - remaining_dw,
+				                     packet_header, opcode, packet_dw, remaining_dw, header_dw);
+				cursor.offset_dw += remaining_dw;
+				execution.m_made_progress = true;
+				continue;
+			}
 			static std::atomic<uint32_t> skip_log_count {0};
 			if (skip_log_count.fetch_add(1) < 2048) {
 				LOGF("\t predicated skip: op=0x%02" PRIx32 ", r=0x%02" PRIx32 ", len=%" PRIu32
@@ -773,7 +824,13 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 
 		const auto packet_dw =
 		    handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
-		EXIT_IF(packet_dw > remaining_dw);
+		if (packet_dw == 0 || packet_dw > remaining_dw) {
+			LogPm4LengthMismatch("handler overran IB", total_dw - remaining_dw, packet_header,
+			                     opcode, packet_dw, remaining_dw, header_dw);
+			cursor.offset_dw += remaining_dw;
+			execution.m_made_progress = true;
+			continue;
+		}
 		if (execution.m_suspended) {
 			return;
 		}
