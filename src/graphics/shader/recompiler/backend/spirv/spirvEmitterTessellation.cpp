@@ -32,32 +32,25 @@ void StoreFactorBits(EmitterState& state, uint32_t pointer, uint32_t bits) {
 	state.builder.AddFunction(spv::OpStore, pointer, floating);
 }
 
-void FactorBranch(EmitterState& state, uint32_t address, uint32_t& is_outer, uint32_t& is_inner,
-                  uint32_t& outer_index) {
-	const auto index = FactorDwordIndex(state, address);
-	is_outer         = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpULessThan, TypeBool(state), is_outer, index,
-	                          ConstantU32(state, 3u));
-	outer_index = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpSelect, TypeU32(state), outer_index, is_outer, index,
-	                          ConstantU32(state, 2u));
-	is_inner = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpUGreaterThanEqual, TypeBool(state), is_inner, index,
-	                          ConstantU32(state, 3u));
-}
-
 uint32_t OuterFactorVariable(EmitterState& state) {
 	return state.tess_variables.at(static_cast<uint32_t>(IR::TessellationAttribute::Factor));
 }
 
+// Drivers (notably NVIDIA) miscompile runtime indexes into TessLevelOuter/Inner.
+// Each dword of a 16-byte triangle factor record is therefore a constant-index store.
 void EmitDynamicFactorStore(EmitterState& state, uint32_t address, uint32_t bits) {
-	uint32_t is_outer = 0, is_inner = 0, outer_index = 0;
-	FactorBranch(state, address, is_outer, is_inner, outer_index);
-	EmitIfCondition(state, is_outer, [&] {
-		StoreFactorBits(state, FactorBuiltinPointer(state, OuterFactorVariable(state), outer_index),
-		                bits);
-	});
-	EmitIfCondition(state, is_inner, [&] {
+	const auto index = FactorDwordIndex(state, address);
+	const auto outer = OuterFactorVariable(state);
+	for (uint32_t slot = 0; slot < 3u; slot++) {
+		const auto current = slot;
+		EmitIfCondition(state, EmitCompareU32Constant(state, spv::OpIEqual, index, current),
+		                [&state, outer, bits, current] {
+			                StoreFactorBits(state, FactorBuiltinPointer(state, outer,
+			                                                            ConstantU32(state, current)),
+			                                bits);
+		                });
+	}
+	EmitIfCondition(state, EmitCompareU32Constant(state, spv::OpIEqual, index, 3u), [&] {
 		StoreFactorBits(state,
 		                FactorBuiltinPointer(state, state.tess_inner_variable, ConstantU32(state, 0u)),
 		                bits);
@@ -65,17 +58,26 @@ void EmitDynamicFactorStore(EmitterState& state, uint32_t address, uint32_t bits
 }
 
 uint32_t EmitDynamicFactorLoad(EmitterState& state, uint32_t address) {
-	uint32_t is_outer = 0, is_inner = 0, outer_index = 0;
-	FactorBranch(state, address, is_outer, is_inner, outer_index);
-	const auto outer_bits = EmitValueOrZeroIfCondition(state, is_outer, [&] {
-		return LoadFactorBits(
-		    state, FactorBuiltinPointer(state, OuterFactorVariable(state), outer_index));
-	});
-	const auto inner_bits = EmitValueOrZeroIfCondition(state, is_inner, [&] {
-		return LoadFactorBits(
-		    state, FactorBuiltinPointer(state, state.tess_inner_variable, ConstantU32(state, 0u)));
-	});
-	return EmitBinaryU32(state, spv::OpBitwiseOr, outer_bits, inner_bits);
+	const auto index = FactorDwordIndex(state, address);
+	const auto outer = OuterFactorVariable(state);
+	uint32_t   bits  = ConstantU32(state, 0u);
+	for (uint32_t slot = 0; slot < 3u; slot++) {
+		const auto current   = slot;
+		const auto slot_bits = EmitValueOrZeroIfCondition(
+		    state, EmitCompareU32Constant(state, spv::OpIEqual, index, current),
+		    [&state, outer, current] {
+			    return LoadFactorBits(
+			        state, FactorBuiltinPointer(state, outer, ConstantU32(state, current)));
+		    });
+		bits = EmitBinaryU32(state, spv::OpBitwiseOr, bits, slot_bits);
+	}
+	const auto inner_bits = EmitValueOrZeroIfCondition(
+	    state, EmitCompareU32Constant(state, spv::OpIEqual, index, 3u), [&] {
+		    return LoadFactorBits(
+		        state,
+		        FactorBuiltinPointer(state, state.tess_inner_variable, ConstantU32(state, 0u)));
+	    });
+	return EmitBinaryU32(state, spv::OpBitwiseOr, bits, inner_bits);
 }
 
 uint32_t TessellationPointer(ValueEmitContext& ctx, const IR::Inst& inst) {
@@ -119,10 +121,18 @@ uint32_t TessellationPointer(ValueEmitContext& ctx, const IR::Inst& inst) {
 		state.builder.AddFunction(spv::OpAccessChain, type, pointer, variable, attribute,
 		                          component);
 	} else {
-		const auto vertex =
-		    kind == Attribute::ControlOutput
-		        ? EmitLaneId(state)
-		        : EmitBinaryU32(state, spv::OpUDiv, address, ConstantU32(state, stride));
+		uint32_t vertex;
+		if (kind == Attribute::ControlOutput) {
+			vertex = EmitLaneId(state);
+		} else {
+			// Guest rings are indexed by PrimitiveId * patch_stride + cp * stride.
+			// Vulkan HS/TES I/O is one patch, so the control-point index must wrap.
+			const auto count = kind == Attribute::ControlInput ? tess.input_control_points
+			                                                   : tess.output_control_points;
+			EXIT_IF(count == 0u);
+			vertex = EmitBinaryU32(state, spv::OpUDiv, address, ConstantU32(state, stride));
+			vertex = EmitBinaryU32(state, spv::OpUMod, vertex, ConstantU32(state, count));
+		}
 		state.builder.AddFunction(spv::OpAccessChain, type, pointer, variable, vertex, attribute,
 		                          component);
 	}
