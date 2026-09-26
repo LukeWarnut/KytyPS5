@@ -5,6 +5,79 @@
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
 
+uint32_t FactorBuiltinPointer(EmitterState& state, uint32_t variable, uint32_t index) {
+	const auto pointer = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpAccessChain,
+	                          TypePointer(state, spv::StorageClassOutput, TypeF32(state)), pointer,
+	                          variable, index);
+	return pointer;
+}
+
+uint32_t FactorDwordIndex(EmitterState& state, uint32_t address) {
+	const auto dword = EmitBinaryU32(state, spv::OpUDiv, address, ConstantU32(state, 4u));
+	return EmitBinaryU32(state, spv::OpUMod, dword, ConstantU32(state, 4u));
+}
+
+uint32_t LoadFactorBits(EmitterState& state, uint32_t pointer) {
+	const auto floating = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, TypeF32(state), floating, pointer);
+	const auto bits = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpBitcast, TypeU32(state), bits, floating);
+	return bits;
+}
+
+void StoreFactorBits(EmitterState& state, uint32_t pointer, uint32_t bits) {
+	const auto floating = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpBitcast, TypeF32(state), floating, bits);
+	state.builder.AddFunction(spv::OpStore, pointer, floating);
+}
+
+void FactorBranch(EmitterState& state, uint32_t address, uint32_t& is_outer, uint32_t& is_inner,
+                  uint32_t& outer_index) {
+	const auto index = FactorDwordIndex(state, address);
+	is_outer         = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpULessThan, TypeBool(state), is_outer, index,
+	                          ConstantU32(state, 3u));
+	outer_index = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpSelect, TypeU32(state), outer_index, is_outer, index,
+	                          ConstantU32(state, 2u));
+	is_inner = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpUGreaterThanEqual, TypeBool(state), is_inner, index,
+	                          ConstantU32(state, 3u));
+}
+
+uint32_t OuterFactorVariable(EmitterState& state) {
+	return state.tess_variables.at(static_cast<uint32_t>(IR::TessellationAttribute::Factor));
+}
+
+void EmitDynamicFactorStore(EmitterState& state, uint32_t address, uint32_t bits) {
+	uint32_t is_outer = 0, is_inner = 0, outer_index = 0;
+	FactorBranch(state, address, is_outer, is_inner, outer_index);
+	EmitIfCondition(state, is_outer, [&] {
+		StoreFactorBits(state, FactorBuiltinPointer(state, OuterFactorVariable(state), outer_index),
+		                bits);
+	});
+	EmitIfCondition(state, is_inner, [&] {
+		StoreFactorBits(state,
+		                FactorBuiltinPointer(state, state.tess_inner_variable, ConstantU32(state, 0u)),
+		                bits);
+	});
+}
+
+uint32_t EmitDynamicFactorLoad(EmitterState& state, uint32_t address) {
+	uint32_t is_outer = 0, is_inner = 0, outer_index = 0;
+	FactorBranch(state, address, is_outer, is_inner, outer_index);
+	const auto outer_bits = EmitValueOrZeroIfCondition(state, is_outer, [&] {
+		return LoadFactorBits(
+		    state, FactorBuiltinPointer(state, OuterFactorVariable(state), outer_index));
+	});
+	const auto inner_bits = EmitValueOrZeroIfCondition(state, is_inner, [&] {
+		return LoadFactorBits(
+		    state, FactorBuiltinPointer(state, state.tess_inner_variable, ConstantU32(state, 0u)));
+	});
+	return EmitBinaryU32(state, spv::OpBitwiseOr, outer_bits, inner_bits);
+}
+
 uint32_t TessellationPointer(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto& state          = ctx.state;
 	using Attribute      = IR::TessellationAttribute;
@@ -138,7 +211,15 @@ void DefineTessellationExecutionModes(EmitterState& state) {
 }
 
 uint32_t EmitGetTessellationAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
+	const auto factor =
+	    inst.Arg(0).U32() == static_cast<uint32_t>(IR::TessellationAttribute::Factor);
 	return EmitValueOrZeroIfCondition(ctx.state, ctx.Arg(inst, 2), [&] {
+		if (factor && !inst.Arg(1).IsImmediate()) {
+			return EmitDynamicFactorLoad(ctx.state, ctx.Arg(inst, 1));
+		}
+		if (factor) {
+			return LoadFactorBits(ctx.state, TessellationPointer(ctx, inst));
+		}
 		const auto value = ctx.state.builder.AllocateId();
 		ctx.state.builder.AddFunction(spv::OpLoad, TypeU32(ctx.state), value,
 		                              TessellationPointer(ctx, inst));
@@ -148,13 +229,16 @@ uint32_t EmitGetTessellationAttribute(ValueEmitContext& ctx, const IR::Inst& ins
 
 void EmitSetTessellationAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 	EmitIfCondition(ctx.state, ctx.Arg(inst, 3), [&] {
-		auto value = ctx.Arg(inst, 2);
 		if (inst.Arg(0).U32() == static_cast<uint32_t>(IR::TessellationAttribute::Factor)) {
-			const auto floating = ctx.state.builder.AllocateId();
-			ctx.state.builder.AddFunction(spv::OpBitcast, TypeF32(ctx.state), floating, value);
-			value = floating;
+			if (!inst.Arg(1).IsImmediate()) {
+				EmitDynamicFactorStore(ctx.state, ctx.Arg(inst, 1), ctx.Arg(inst, 2));
+				return;
+			}
+			StoreFactorBits(ctx.state, TessellationPointer(ctx, inst), ctx.Arg(inst, 2));
+			return;
 		}
-		ctx.state.builder.AddFunction(spv::OpStore, TessellationPointer(ctx, inst), value);
+		ctx.state.builder.AddFunction(spv::OpStore, TessellationPointer(ctx, inst),
+		                              ctx.Arg(inst, 2));
 	});
 }
 
