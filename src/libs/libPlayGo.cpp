@@ -1,7 +1,6 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
-#include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
 #include "libs/errno.h"
@@ -54,7 +53,19 @@ union PlayGoOptionalChunk {
 };
 
 static bool ensure_chunks_loaded() {
-	return g_chunks_num != 0 || Loader::SystemContentGetChunksNum(&g_chunks_num);
+	if (g_chunks_num != 0) {
+		return true;
+	}
+	if (Loader::SystemContentGetChunksNum(&g_chunks_num) && g_chunks_num != 0) {
+		return true;
+	}
+	// Dumped packages often omit playgo-chunk.dat. On hardware every title still has PlayGo
+	// metadata with all chunks already local, so scePlayGoOpen succeeds. Returning
+	// PLAYGO_ERROR_NOT_SUPPORT_PLAYGO here makes games such as Atlas Fallen abort platform
+	// setup and then dereference a null context.
+	g_chunks_num = PLAYGO_DEFAULT_CHUNKS_NUM;
+	LOGF("PlayGo: no chunk metadata; treating %" PRIu32 " chunks as fully local\n", g_chunks_num);
+	return true;
 }
 
 static bool is_valid_chunk(uint16_t chunk_id) {
@@ -98,10 +109,7 @@ int KYTY_SYSV_ABI PlayGoInitialize(const PlayGoInitParams* init) {
 	     "\t reserved = %" PRId32 "\n",
 	     reinterpret_cast<uint64_t>(init->buf_addr), init->buf_size, init->reserved);
 
-	if (Config::PlayGoHackEnabled() && !ensure_chunks_loaded()) {
-		g_chunks_num = PLAYGO_DEFAULT_CHUNKS_NUM;
-		LOGF("\t playgo_hack chunks = %" PRIu32 "\n", g_chunks_num);
-	}
+	ensure_chunks_loaded();
 
 	return OK;
 }
