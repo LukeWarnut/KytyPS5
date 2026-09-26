@@ -7,6 +7,9 @@
 #include <algorithm>
 #include <cstdio>
 #include <optional>
+#include <string>
+
+#include <magic_enum.hpp>
 
 namespace Libs::Graphics {
 
@@ -14,18 +17,22 @@ static thread_local CommandScheduler* g_deferred_callback_scheduler = nullptr;
 
 namespace {
 
-void ReportVulkanFatal(const char* what, vk::Result result, uint64_t tick, uint32_t debug_op,
-                       uint64_t debug_submit, uint32_t arg0, uint32_t arg1, uint32_t arg2,
-                       uint32_t arg3, uint64_t arg4) {
-	LOGF("%s failed: %s (%d), tick=%" PRIu64 " debug_op=%u debug_submit=%" PRIu64
+void ReportVulkanFatal(GraphicContext& graphics, const char* what, vk::Result result, uint64_t tick,
+                       uint32_t debug_op, uint64_t debug_submit, uint32_t arg0, uint32_t arg1,
+                       uint32_t arg2, uint32_t arg3, uint64_t arg4) {
+	const auto op_name = std::string(magic_enum::enum_name(static_cast<CommandBufferDebugOp>(debug_op)));
+	LOGF("%s failed: %s (%d), tick=%" PRIu64 " debug_op=%s (%u) debug_submit=%" PRIu64
 	     " args=%u,%u,%u,%u,0x%016" PRIx64 "\n",
-	     what, vk::to_string(result).c_str(), static_cast<int>(result), tick, debug_op,
-	     debug_submit, arg0, arg1, arg2, arg3, arg4);
-	std::printf("%s failed: %s (%d), tick=%" PRIu64 " debug_op=%u debug_submit=%" PRIu64
+	     what, vk::to_string(result).c_str(), static_cast<int>(result), tick, op_name.c_str(),
+	     debug_op, debug_submit, arg0, arg1, arg2, arg3, arg4);
+	std::printf("%s failed: %s (%d), tick=%" PRIu64 " debug_op=%s (%u) debug_submit=%" PRIu64
 	            " args=%u,%u,%u,%u,0x%016" PRIx64 "\n",
-	            what, vk::to_string(result).c_str(), static_cast<int>(result), tick, debug_op,
-	            debug_submit, arg0, arg1, arg2, arg3, arg4);
+	            what, vk::to_string(result).c_str(), static_cast<int>(result), tick, op_name.c_str(),
+	            debug_op, debug_submit, arg0, arg1, arg2, arg3, arg4);
 	std::fflush(stdout);
+	if (result == vk::Result::eErrorDeviceLost) {
+		graphics.LogMemoryBudget();
+	}
 }
 
 } // namespace
@@ -380,7 +387,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	}
 
 	if (result != vk::Result::eSuccess) {
-		ReportVulkanFatal("vkQueueSubmit", result, tick, m_command.m_debug_op,
+		ReportVulkanFatal(graphics, "vkQueueSubmit", result, tick, m_command.m_debug_op,
 		                  m_command.m_debug_submit_id, m_command.m_debug_arg0,
 		                  m_command.m_debug_arg1, m_command.m_debug_arg2, m_command.m_debug_arg3,
 		                  m_command.m_debug_arg4);

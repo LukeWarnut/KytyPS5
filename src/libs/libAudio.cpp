@@ -1129,6 +1129,9 @@ LIB_DEFINE(InitAudio_1_Audio3d) {
 	LIB_FUNC("YaaDbDwKpFM", Audio3d::Audio3dPortGetQueueLevel);
 	LIB_FUNC("lw0qrdSjZt8", Audio3d::Audio3dPortAdvance);
 	LIB_FUNC("VEVhZ9qd4ZY", Audio3d::Audio3dPortPush);
+	LIB_FUNC("jO2tec4dJ2M", Audio3d::Audio3dObjectReserve);
+	LIB_FUNC("4uyHN9q4ZeU", Audio3d::Audio3dObjectSetAttributes);
+	LIB_FUNC("1HXxo-+1qCw", Audio3d::Audio3dObjectUnreserve);
 }
 
 } // namespace LibAudio3d

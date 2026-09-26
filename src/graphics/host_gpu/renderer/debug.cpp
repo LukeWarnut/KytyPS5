@@ -304,7 +304,14 @@ static void RtCheck(const HW::RenderTarget& rt) {
 		// EXIT_NOT_IMPLEMENTED(rt.dcc.color_transform != 0x00000000);
 		EXIT_NOT_IMPLEMENTED(rt.dcc.overwrite_combiner_disable != false);
 		// EXIT_NOT_IMPLEMENTED(rt.dcc.data_write_on_dcc_clear_to_reg != false);
-		EXIT_NOT_IMPLEMENTED(rt.dcc.dcc_clear_key_enable != false);
+		if (rt.dcc.dcc_clear_key_enable) {
+			// DCC clears are materialized by the texture cache into native Vulkan images.
+			// The guest clear-key enable flag alone does not require a separate host mode.
+			static std::atomic_bool logged {false};
+			if (!logged.exchange(true, std::memory_order_relaxed)) {
+				LOGF("RenderTarget: accepting PS5 DCC clear keys through texture-cache clear handling\n");
+			}
+		}
 		if (rt.cmask.addr != 0x0000000000000000 || rt.fmask.addr != 0x0000000000000000 ||
 		    rt.dcc_addr.addr != 0x0000000000000000) {
 			static bool logged = false;

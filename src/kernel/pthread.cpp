@@ -3588,8 +3588,14 @@ int KYTY_SYSV_ABI PthreadGetname(Pthread thread, char* name) {
 		return KERNEL_ERROR_EFAULT;
 	}
 
-	strncpy(name, thread->name.c_str(), 32);
-	name[31] = '\0';
+	// Copy the name and one NUL only. strncpy() would pad out to 32 bytes and
+	// smash a stack canary when the caller reserved a shorter slot.
+	const auto* src = thread->name.c_str();
+	size_t      i   = 0;
+	for (; i < 31 && src[i] != '\0'; ++i) {
+		name[i] = src[i];
+	}
+	name[i] = '\0';
 
 	return OK;
 }

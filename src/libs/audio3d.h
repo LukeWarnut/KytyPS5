@@ -20,6 +20,10 @@ int KYTY_SYSV_ABI  Audio3dPortGetQueueLevel(uint32_t port_id, uint32_t* queue_le
                                             uint32_t* queue_available);
 int KYTY_SYSV_ABI  Audio3dPortAdvance(uint32_t port_id);
 int KYTY_SYSV_ABI  Audio3dPortPush(uint32_t port_id, uint32_t blocking);
+int KYTY_SYSV_ABI  Audio3dObjectReserve(uint32_t port_id, uint32_t* object_id);
+int KYTY_SYSV_ABI  Audio3dObjectSetAttributes(uint32_t port_id, uint32_t object_id,
+                                              uint64_t num_attributes, const void* attribute_array);
+int KYTY_SYSV_ABI  Audio3dObjectUnreserve(uint32_t port_id, uint32_t object_id);
 
 } // namespace Audio3d
 

@@ -27,6 +27,8 @@ struct Audio3dOpenParameters {
 	// uint32_t num_beds;
 };
 
+static_assert(sizeof(Audio3dOpenParameters) == 0x20);
+
 struct Audio3dData {
 	enum class State { Empty, Ready, Play };
 
@@ -44,6 +46,8 @@ struct Audio3dInternal {
 	float                 downmix_spread_radius       = 2.0f;
 	int                   downmix_spread_height_aware = 0;
 	uint32_t              data_index                  = 0;
+	uint32_t              next_object_id              = 1;
+	uint32_t              reserved_objects            = 0;
 	bool                  used                        = false;
 	std::atomic_bool      playback_finished           = false;
 };
@@ -114,7 +118,11 @@ int KYTY_SYSV_ABI Audio3dPortOpen(int user_id, const Audio3dOpenParameters* para
 
 	EXIT_NOT_IMPLEMENTED(parameters == nullptr);
 	EXIT_NOT_IMPLEMENTED(id == nullptr);
-	EXIT_NOT_IMPLEMENTED(parameters->size != 0x20);
+	LOGF("\t parameter_size = 0x%zx\n", parameters->size);
+	// Jagged Alliance 3 uses a 0x28-byte block with the same timing/queue prefix.
+	// The playback simulator consumes only that prefix; leave extension fields unread.
+	EXIT_NOT_IMPLEMENTED(parameters->size != sizeof(Audio3dOpenParameters) &&
+	                     parameters->size != 0x28);
 
 	LOGF("\t user_id     = %d\n"
 	     "\t granularity = %u\n"
@@ -309,6 +317,64 @@ int KYTY_SYSV_ABI Audio3dPortPush(uint32_t port_id, uint32_t blocking) {
 				Common::Thread::SleepMicro(wait_time);
 			}
 		}
+	}
+
+	return OK;
+}
+
+int KYTY_SYSV_ABI Audio3dObjectReserve(uint32_t port_id, uint32_t* object_id) {
+	PRINT_NAME();
+
+	EXIT_NOT_IMPLEMENTED(port_id >= MAX_PORTS);
+	EXIT_NOT_IMPLEMENTED(!g_ports[port_id].used);
+	EXIT_NOT_IMPLEMENTED(object_id == nullptr);
+
+	auto* port = &g_ports[port_id];
+	EXIT_NOT_IMPLEMENTED(port->reserved_objects >= port->params.max_objects);
+
+	uint32_t id = port->next_object_id++;
+	if (id == 0u || id == 0xFFFFFFFFu) {
+		id = port->next_object_id++;
+	}
+
+	port->reserved_objects++;
+	*object_id = id;
+
+	if (port->reserved_objects == 1 || port->reserved_objects == port->params.max_objects) {
+		LOGF("\t object_id = %u (reserved %u / %u)\n", id, port->reserved_objects,
+		     port->params.max_objects);
+	}
+
+	return OK;
+}
+
+int KYTY_SYSV_ABI Audio3dObjectSetAttributes(uint32_t port_id, uint32_t object_id,
+                                             uint64_t num_attributes, const void* attribute_array) {
+	PRINT_NAME();
+
+	EXIT_NOT_IMPLEMENTED(port_id >= MAX_PORTS);
+	EXIT_NOT_IMPLEMENTED(!g_ports[port_id].used);
+	EXIT_NOT_IMPLEMENTED(num_attributes > 0 && attribute_array == nullptr);
+
+	// 3D object pose/PCM attributes are unused while output is simulated at port granularity.
+	static std::atomic_bool logged {false};
+	if (!logged.exchange(true, std::memory_order_relaxed)) {
+		LOGF("\t object_id = %u, num_attributes = %" PRIu64 "\n", object_id, num_attributes);
+	}
+
+	return OK;
+}
+
+int KYTY_SYSV_ABI Audio3dObjectUnreserve(uint32_t port_id, uint32_t object_id) {
+	PRINT_NAME();
+
+	EXIT_NOT_IMPLEMENTED(port_id >= MAX_PORTS);
+	EXIT_NOT_IMPLEMENTED(!g_ports[port_id].used);
+	EXIT_NOT_IMPLEMENTED(object_id == 0u || object_id == 0xFFFFFFFFu);
+
+	auto* port = &g_ports[port_id];
+	if (port->reserved_objects > 0) {
+		port->reserved_objects--;
 	}
 
 	return OK;

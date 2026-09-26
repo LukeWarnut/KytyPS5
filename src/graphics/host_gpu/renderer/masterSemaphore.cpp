@@ -26,7 +26,10 @@ MasterSemaphore::~MasterSemaphore() {
 void MasterSemaphore::Refresh() {
 	uint64_t   counter = 0;
 	const auto result  = m_graphics.device.getSemaphoreCounterValue(m_semaphore, &counter);
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	if (result != vk::Result::eSuccess) {
+		EXIT("Vulkan getSemaphoreCounterValue failed: %s (%d), known GPU tick=%" PRIu64 "\n",
+		     vk::to_string(result).c_str(), static_cast<int>(result), KnownGpuTick());
+	}
 
 	auto known = m_gpu_tick.load(std::memory_order_acquire);
 	while (known < counter &&
@@ -49,9 +52,23 @@ void MasterSemaphore::Wait(uint64_t tick) {
 	wait_info.pSemaphores    = &m_semaphore;
 	wait_info.pValues        = &tick;
 
-	const auto result = m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
-	Refresh();
+	// Some Windows GPU drivers treat UINT64_MAX as a signed -1 ns timeout and return
+	// immediately with TIMEOUT/UNKNOWN. Wait in finite slices until the GPU tick arrives.
+	constexpr uint64_t kWaitNs = 1'000'000'000ull;
+	for (;;) {
+		const auto result = m_graphics.device.waitSemaphores(&wait_info, kWaitNs);
+		if (result == vk::Result::eSuccess || result == vk::Result::eTimeout) {
+			Refresh();
+			if (IsFree(tick)) {
+				return;
+			}
+			continue;
+		}
+		EXIT("Vulkan waitSemaphores failed: %s (%d), requested tick=%" PRIu64
+		     ", known GPU tick=%" PRIu64 ", next tick=%" PRIu64 "\n",
+		     vk::to_string(result).c_str(), static_cast<int>(result), tick, KnownGpuTick(),
+		     CurrentTick());
+	}
 }
 
 } // namespace Libs::Graphics
